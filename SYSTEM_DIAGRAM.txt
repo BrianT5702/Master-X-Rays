@@ -1,0 +1,160 @@
+================================================================================
+                    SYSTEM ARCHITECTURE DIAGRAM
+         Rare Lung Disease Detection (Nodules and Fibrosis)
+================================================================================
+
+                +------------------------------------------------+
+                |              Input X-Ray Image                 |
+                |      (Raw frontal-view CXR from dataset)       |
+                |         Format: PNG, various resolutions        |
+                +------------------------------------------------+
+                                  |
+                                  v
+                +------------------------------------------------+
+                |              Preprocessing Module              |
+                |  Location: src/data/datasets.py                |
+                |                                                 |
+                |  Operations:                                   |
+                |  ✓ Resize to 224×224 pixels                    |
+                |  ✓ Grayscale → 3-channel replication            |
+                |  ✓ Normalization (ImageNet mean/std)           |
+                |  ✓ Label vector encoding (binary)              |
+                |  ✓ Data augmentation:                          |
+                |    - Horizontal flip (prob: 0.5)                |
+                |    - Rotation (±7.5 degrees)                   |
+                |    - Random noise (std: 0.01)                  |
+                |  ✓ Train/Val/Test splitting (80/10/10)         |
+                +------------------------------------------------+
+                                  |
+                                  v
+                +------------------------------------------------+
+                |        Imbalance-Aware Training Module         |
+                |  Location: src/training/lightning_module.py    |
+                |                                                 |
+                |  Loss Functions (configurable):                |
+                |  ✓ Weighted BCE                                |
+                |  ✓ Class-Balanced Loss                         |
+                |  ✓ Focal Loss (default)                        |
+                |                                                 |
+                |  Data-Level Techniques:                         |
+                |  ✓ Batch-balanced sampling (optional)           |
+                |  ✓ Class weights: [16.71, 65.50]               |
+                |    [Nodule, Fibrosis]                          |
+                |                                                 |
+                |  (Minority-sensitive optimisation)              |
+                +------------------------------------------------+
+                                  |
+                                  v
+                +------------------------------------------------+
+                |          DenseNet-121 Feature Extractor        |
+                |  Location: src/models/basemodels.py             |
+                |                                                 |
+                |  Architecture:                                 |
+                |  ✓ Dense blocks (4 blocks)                      |
+                |  ✓ Transition layers                           |
+                |  ✓ Global average pooling                      |
+                |  ✓ Fully-connected classifier (2 outputs)     |
+                |                                                 |
+                |  Alternatives:                                 |
+                |  - ResNet-50                                   |
+                |  - Swin Transformer (Swin-T)                   |
+                |                                                 |
+                |  Pretrained: ImageNet weights                    |
+                +------------------------------------------------+
+                                  |
+                                  v
+                +------------------------------------------------+
+                |              Multi-Label Prediction            |
+                |  Location: src/training/lightning_module.py    |
+                |                                                 |
+                |  Output:                                       |
+                |  ✓ Sigmoid activation for 2 classes            |
+                |  ✓ Independent binary predictions             |
+                |  ✓ Probability scores: [P(Nodule), P(Fibrosis)]|
+                |                                                 |
+                |  Metrics:                                       |
+                |  ✓ Multilabel F1-Score (macro)                 |
+                |  ✓ Multilabel AUROC (macro)                    |
+                |  ✓ Multilabel Accuracy (macro)                |
+                +------------------------------------------------+
+                                  |
+                                  v
+                +------------------------------------------------+
+                |             Explainable AI Module             |
+                |  Location: src/xai/gradcam.py                   |
+                |                                                 |
+                |  Methods:                                      |
+                |  ✓ Grad-CAM                                    |
+                |  ✓ Grad-CAM++ (enhanced)                       |
+                |                                                 |
+                |  Output:                                       |
+                |  ✓ Heatmap generation                         |
+                |  ✓ Activation region visualisation            |
+                |  ✓ Overlay on original images                 |
+                |  ✓ Interpretability output                    |
+                +------------------------------------------------+
+                                  |
+                                  v
+                +------------------------------------------------+
+                |               Final Output                     |
+                |                                                 |
+                |  Predictions:                                  |
+                |  - Probability scores for each class           |
+                |  - Binary predictions (threshold: 0.3)         |
+                |                                                 |
+                |  Visualizations:                               |
+                |  - Heatmaps showing model focus regions        |
+                |  - Overlaid heatmaps on original images       |
+                |  - Class-specific attention maps              |
+                +------------------------------------------------+
+
+================================================================================
+                         COMPONENT SUMMARY
+================================================================================
+
+1. PREPROCESSING MODULE
+   - Resizes images to 224×224
+   - Normalizes with ImageNet statistics
+   - Applies data augmentation (flip, rotation, noise)
+   - Encodes binary labels for Nodule and Fibrosis
+   - Splits data into train/val/test (80/10/10)
+
+2. IMBALANCE-AWARE TRAINING
+   - Focal Loss (default) with alpha=0.75, gamma=2.0
+   - Class-Balanced Loss (alternative)
+   - Weighted BCE (alternative)
+   - Class weights: [16.71, 65.50] for [Nodule, Fibrosis]
+   - Optional batch-balanced sampling
+
+3. DENSENET-121 BACKBONE
+   - Pretrained on ImageNet
+   - 4 dense blocks with transition layers
+   - Global average pooling
+   - 2-class classifier output
+
+4. MULTI-LABEL PREDICTION
+   - Sigmoid activation for independent binary predictions
+   - Threshold: 0.3 (optimized for rare diseases)
+   - Metrics: F1-Score, AUROC, Accuracy (macro-averaged)
+
+5. EXPLAINABLE AI (Grad-CAM)
+   - Gradient-weighted Class Activation Mapping
+   - Grad-CAM++ for enhanced localization
+   - Heatmap visualization overlaid on original images
+   - Shows model attention regions
+
+================================================================================
+                         KEY FEATURES
+================================================================================
+
+✓ Handles extreme class imbalance (1:16 and 1:65 ratios)
+✓ Multiple loss function options for experimentation
+✓ Pretrained ImageNet backbone for transfer learning
+✓ Comprehensive data augmentation pipeline
+✓ Interpretable AI with Grad-CAM heatmaps
+✓ Configurable architecture (DenseNet, ResNet, Swin-T)
+✓ Multi-label classification for independent disease detection
+✓ Production-ready with PyTorch Lightning framework
+
+================================================================================
+

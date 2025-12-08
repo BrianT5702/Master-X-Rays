@@ -1,0 +1,43 @@
+experiment:
+  name: baseline
+  seed: 42
+
+data:
+  nih_root: "datasets/NIH Chest X-Rays Master Datasets/archive"
+  chexpert_root: "datasets/Standford ML Group X-Rays Chest Master Datasets/cheXphoto-master/cheXphoto-master"
+  csv_path: "datasets/NIH Chest X-Rays Master Datasets/archive/Data_Entry_2017.csv"
+  image_size: [224, 224]
+  num_workers: 4  # Increase for faster data loading (adjust based on CPU cores)
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  patient_split: true
+
+augmentations:
+  horizontal_flip_prob: 0.5
+  rotation_degrees: 7.5
+  random_noise_std: 0.01
+  use_gan_synthetic: false
+
+training:
+  batch_size: 32
+  max_epochs: 40  # Reduced from 50 - should be enough with class weights
+  precision: "16-mixed"  # Use mixed precision on GPU (faster, same accuracy), falls back to 32 on CPU
+  optimizer: adamw
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 5
+
+model:
+  backbone: densenet121
+  pretrained: true
+  dropout: 0.2
+  num_classes: 2
+  class_weights: [16.71, 65.50]  # [Nodule, Fibrosis] - balances extreme class imbalance
+
+loss:
+  name: focal
+  alpha: 0.75
+  gamma: 2.0
+

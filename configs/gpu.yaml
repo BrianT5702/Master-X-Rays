@@ -21,7 +21,7 @@ augmentations:
 
 training:
   batch_size: 32  # Larger batch size for GPU (can increase if you have more VRAM)
-  max_epochs: 40
+  max_epochs: 50
   precision: "16-mixed"  # Mixed precision for faster training on GPU
   optimizer: adamw
   learning_rate: 0.00005  # Further reduced: extreme imbalance needs very careful learning

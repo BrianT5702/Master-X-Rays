@@ -29,7 +29,7 @@ def build_backbone(
                 torch.nn.Linear(in_features, num_classes)
             )
         else:
-            model.classifier = torch.nn.Linear(in_features, num_classes)
+        model.classifier = torch.nn.Linear(in_features, num_classes)
     elif name == "resnet50":
         model = tv_models.resnet50(weights="DEFAULT" if pretrained else None)
         in_features = model.fc.in_features
@@ -39,7 +39,7 @@ def build_backbone(
                 torch.nn.Linear(in_features, num_classes)
             )
         else:
-            model.fc = torch.nn.Linear(in_features, num_classes)
+        model.fc = torch.nn.Linear(in_features, num_classes)
     elif name == "swin_t":
         model = tv_models.swin_t(weights="DEFAULT" if pretrained else None)
         in_features = model.head.in_features
@@ -49,7 +49,7 @@ def build_backbone(
                 torch.nn.Linear(in_features, num_classes)
             )
         else:
-            model.head = torch.nn.Linear(in_features, num_classes)
+        model.head = torch.nn.Linear(in_features, num_classes)
     else:
         raise ValueError(f"Unsupported backbone: {name}")
 

@@ -18,6 +18,7 @@ import torch
 torch.set_float32_matmul_precision('medium')  # 'medium' = good balance, 'high' = faster but less precise
 
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 import yaml
 
 from src.data.datasets import create_dataloaders
@@ -128,20 +129,82 @@ def main() -> None:
     else:
         precision = training_cfg["precision"]  # Use config precision for GPU
 
+    # --- CHECKPOINT CALLBACKS ---
+    # Create checkpoints directory if it doesn't exist
+    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir.mkdir(exist_ok=True)
+    
+    # 1. Best AUC (Standard stability metric)
+    checkpoint_auc = ModelCheckpoint(
+        dirpath="checkpoints/",
+        filename="best-auc-{epoch:02d}-{val_auc:.4f}",
+        monitor="val_auc",
+        mode="max",
+        save_top_k=1,
+        save_last=False,
+    )
+    
+    # 2. Best F1 Score (Critical for rare disease balance)
+    checkpoint_f1 = ModelCheckpoint(
+        dirpath="checkpoints/",
+        filename="best-f1-{epoch:02d}-{val_f1:.4f}",
+        monitor="val_f1",
+        mode="max",
+        save_top_k=1,
+        save_last=False,
+    )
+    
+    # 3. Lowest Validation Loss (Safest against overfitting)
+    checkpoint_loss = ModelCheckpoint(
+        dirpath="checkpoints/",
+        filename="best-loss-{epoch:02d}-{val_loss:.4f}",
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=False,
+    )
+
     trainer = pl.Trainer(
         max_epochs=training_cfg["max_epochs"],
         accelerator=accelerator,
         devices=args.devices,
         precision=precision,
         log_every_n_steps=10,
+        callbacks=[checkpoint_auc, checkpoint_f1, checkpoint_loss],  # Add callbacks here
     )
-
+    
+    # 1. RUN TRAINING
     trainer.fit(
         lightning_module,
         train_dataloaders=dataloaders["train"],
         val_dataloaders=dataloaders["val"],
     )
-    trainer.test(lightning_module, dataloaders["test"])
+    
+    # 2. TEST AUTOMATICALLY (Best Models)
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE. STARTING EVALUATION OF BEST CHECKPOINTS.")
+    print("="*60)
+    
+    # Test Best AUC Model
+    if checkpoint_auc.best_model_path:
+        print(f"\n>>> Testing Model with Best AUC: {checkpoint_auc.best_model_path}")
+        trainer.test(dataloaders=dataloaders["test"], ckpt_path=checkpoint_auc.best_model_path)
+    else:
+        print("\n>>> Warning: No Best AUC checkpoint found (metric might be NaN).")
+    
+    # Test Best F1 Model (Most important for your thesis)
+    if checkpoint_f1.best_model_path:
+        print(f"\n>>> Testing Model with Best F1 Score: {checkpoint_f1.best_model_path}")
+        trainer.test(dataloaders=dataloaders["test"], ckpt_path=checkpoint_f1.best_model_path)
+    else:
+        print("\n>>> Warning: No Best F1 checkpoint found.")
+    
+    # Test Best Loss Model
+    if checkpoint_loss.best_model_path:
+        print(f"\n>>> Testing Model with Best (Lowest) Loss: {checkpoint_loss.best_model_path}")
+        trainer.test(dataloaders=dataloaders["test"], ckpt_path=checkpoint_loss.best_model_path)
+    else:
+        print("\n>>> Warning: No Best Loss checkpoint found.")
 
 
 if __name__ == "__main__":

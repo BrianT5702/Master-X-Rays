@@ -28,16 +28,17 @@ training:
   weight_decay: 0.01
   scheduler: cosine
   warmup_epochs: 5
+  prediction_threshold: 0.25  # Raise threshold to cut Nodule false positives
 
 model:
   backbone: densenet121
   pretrained: true
   dropout: 0.2
   num_classes: 2
-  class_weights: [16.71, 65.50]  # [Nodule, Fibrosis] - balances extreme class imbalance
+  class_weights: null # [Nodule, Fibrosis] - balances extreme class imbalance
 
 loss:
   name: focal
-  alpha: 0.75
+  alpha: 0.25
   gamma: 2.0
 

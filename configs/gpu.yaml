@@ -29,6 +29,7 @@ training:
   scheduler: cosine
   warmup_epochs: 5
   use_weighted_sampling: false  # Can enable for better class balance
+  prediction_threshold: 0.25  # Raise threshold to reduce Nodule false positives
 
 model:
   backbone: densenet121
@@ -40,5 +41,5 @@ model:
 
 loss:
   name: focal
-  alpha: 0.75
+  alpha: 0.25
   gamma: 2.0

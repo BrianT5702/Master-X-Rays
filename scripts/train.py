@@ -82,6 +82,12 @@ def main() -> None:
         pretrained=model_cfg["pretrained"],
         dropout=model_cfg.get("dropout", 0.0),
     )
+    # Optional speedup (PyTorch 2.x): compile model for RTX 3000+
+    try:
+        model = torch.compile(model, mode="max-autotune")
+        print("✅ torch.compile enabled")
+    except Exception as e:
+        print(f"⚠️ torch.compile skipped: {e}")
     # Get prediction threshold from config (default 0.3 for imbalanced rare disease detection)
     prediction_threshold = training_cfg.get("prediction_threshold", 0.3)
     
@@ -131,13 +137,8 @@ def main() -> None:
         precision = training_cfg["precision"]  # Use config precision for GPU
 
     # --- CHECKPOINT CALLBACKS ---
-    # Create checkpoints directory if it doesn't exist
-    checkpoint_dir = Path("checkpoints")
-    checkpoint_dir.mkdir(exist_ok=True)
-    
-    # 1. Best AUC (Standard stability metric)
+    # Let PL place checkpoints in the logger directory (lightning_logs/version_x/checkpoints)
     checkpoint_auc = ModelCheckpoint(
-        dirpath="checkpoints/",
         filename="best-auc-{epoch:02d}-{val_auc:.4f}",
         monitor="val_auc",
         mode="max",
@@ -145,9 +146,7 @@ def main() -> None:
         save_last=False,
     )
     
-    # 2. Best F1 Score (Critical for rare disease balance)
     checkpoint_f1 = ModelCheckpoint(
-        dirpath="checkpoints/",
         filename="best-f1-{epoch:02d}-{val_f1:.4f}",
         monitor="val_f1",
         mode="max",
@@ -155,9 +154,7 @@ def main() -> None:
         save_last=False,
     )
     
-    # 3. Lowest Validation Loss (Safest against overfitting)
     checkpoint_loss = ModelCheckpoint(
-        dirpath="checkpoints/",
         filename="best-loss-{epoch:02d}-{val_loss:.4f}",
         monitor="val_loss",
         mode="min",
@@ -171,6 +168,7 @@ def main() -> None:
         devices=args.devices,
         precision=precision,
         log_every_n_steps=10,
+        default_root_dir=str(PROJECT_ROOT),  # ensure logger/checkpoints under project root
         callbacks=[checkpoint_auc, checkpoint_f1, checkpoint_loss],  # Add callbacks here
     )
 
@@ -181,112 +179,98 @@ def main() -> None:
         val_dataloaders=dataloaders["val"],
     )
     
-    # 2. TEST AUTOMATICALLY (Best Models)
-    print("\n" + "="*60)
-    print("TRAINING COMPLETE. STARTING EVALUATION OF BEST CHECKPOINTS.")
-    print("="*60)
-    
-    # Test Best AUC Model
-    if checkpoint_auc.best_model_path:
-        print(f"\n>>> Testing Model with Best AUC: {checkpoint_auc.best_model_path}")
-        trainer.test(dataloaders=dataloaders["test"], ckpt_path=checkpoint_auc.best_model_path)
-    else:
-        print("\n>>> Warning: No Best AUC checkpoint found (metric might be NaN).")
-    
-    # Test Best F1 Model (Most important for your thesis)
-    if checkpoint_f1.best_model_path:
-        print(f"\n>>> Testing Model with Best F1 Score: {checkpoint_f1.best_model_path}")
-        trainer.test(dataloaders=dataloaders["test"], ckpt_path=checkpoint_f1.best_model_path)
-    else:
-        print("\n>>> Warning: No Best F1 checkpoint found.")
-    
-    # Test Best Loss Model
-    if checkpoint_loss.best_model_path:
-        print(f"\n>>> Testing Model with Best (Lowest) Loss: {checkpoint_loss.best_model_path}")
-        trainer.test(dataloaders=dataloaders["test"], ckpt_path=checkpoint_loss.best_model_path)
-    else:
-        print("\n>>> Warning: No Best Loss checkpoint found.")
-    
-    # 3. GENERATE HEATMAPS AUTOMATICALLY (Best Models)
-    print("\n" + "="*60)
-    print("GENERATING GRAD-CAM HEATMAPS FOR BEST MODELS")
-    print("="*60)
-    
-    # Generate version identifier from timestamp
-    from datetime import datetime
-    version = f"version_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    # Base output directory for all heatmaps
-    heatmaps_base_dir = PROJECT_ROOT / "outputs" / "heatmaps"
-    heatmaps_base_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"📁 Using version folder: {version}")
-    print(f"   Structure: outputs/heatmaps/{version}/[best-auc|best-f1|best-loss]/")
-    print()
-    
-    # Generate heatmaps for Best AUC Model
-    if checkpoint_auc.best_model_path:
-        print(f"\n>>> Generating heatmaps for Best AUC Model...")
-        generate_heatmaps_for_checkpoint(
-            checkpoint_path=Path(checkpoint_auc.best_model_path),
-            config_path=args.config,
-            output_dir=heatmaps_base_dir,
-            model_type="best-auc",
-            version=version,
-            batch_size=16,
-            num_samples=32,
-            target_class=None,  # Auto (highest prediction)
-            method="gradcam++",
-            num_workers=0,  # Windows compatibility
-        )
-    else:
-        print("\n>>> Skipping heatmap generation for Best AUC (checkpoint not found).")
-    
-    # Generate heatmaps for Best F1 Model (Most important for your thesis)
-    if checkpoint_f1.best_model_path:
-        print(f"\n>>> Generating heatmaps for Best F1 Model...")
-        generate_heatmaps_for_checkpoint(
-            checkpoint_path=Path(checkpoint_f1.best_model_path),
-            config_path=args.config,
-            output_dir=heatmaps_base_dir,
-            model_type="best-f1",
-            version=version,
-            batch_size=16,
-            num_samples=32,
-            target_class=None,  # Auto (highest prediction)
-            method="gradcam++",
-            num_workers=0,  # Windows compatibility
-        )
-    else:
-        print("\n>>> Skipping heatmap generation for Best F1 (checkpoint not found).")
-    
-    # Generate heatmaps for Best Loss Model
-    if checkpoint_loss.best_model_path:
-        print(f"\n>>> Generating heatmaps for Best Loss Model...")
-        generate_heatmaps_for_checkpoint(
-            checkpoint_path=Path(checkpoint_loss.best_model_path),
-            config_path=args.config,
-            output_dir=heatmaps_base_dir,
-            model_type="best-loss",
-            version=version,
-            batch_size=16,
-            num_samples=32,
-            target_class=None,  # Auto (highest prediction)
-            method="gradcam++",
-            num_workers=0,  # Windows compatibility
-        )
-    else:
-        print("\n>>> Skipping heatmap generation for Best Loss (checkpoint not found).")
-    
+    # Helper for heatmaps
+    def run_heatmap_generation(
+        ckpt_path: str,
+        output_name: str,
+        version_dir: Path,
+    ) -> None:
+        try:
+            generate_heatmaps_for_checkpoint(
+                checkpoint_path=Path(ckpt_path),
+                config_path=args.config,
+                output_dir=Path("outputs") / "heatmaps",
+                model_type=output_name,
+                version=version_dir.name,
+                batch_size=16,
+                num_samples=32,
+                target_class=None,
+                method="gradcam++",
+                num_workers=0,
+            )
+        except Exception as e:
+            print(f"    [Error] Heatmap generation failed for {output_name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    print("\n" + "="*50)
+    print("TRAINING COMPLETE. STARTING EVALUATION & VISUALIZATION.")
+    print("="*50)
+
+    # 1. Setup Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 2. Get Version Info (Matches lightning_logs/version_X)
+    try:
+        version = trainer.logger.version if trainer.logger else "unknown"
+    except Exception:
+        version = "unknown"
+
+    version_str = f"version_{version}"
+    print(f"[*] Current Run Version: {version_str}")
+
+    # 3. Setup Heatmap Directory: outputs/heatmaps/version_X
+    heatmap_version_dir = Path("outputs") / "heatmaps" / version_str
+    heatmap_version_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[*] Heatmaps will be saved to: {heatmap_version_dir}")
+
+    checkpoints_to_process = [
+        ("best_auc_model", checkpoint_auc),
+        ("best_f1_model", checkpoint_f1),
+        ("best_loss_model", checkpoint_loss),
+    ]
+
+    # Helper to print where files actually went
+    if trainer.logger and trainer.logger.log_dir:
+        print(f"[*] Artifacts are saved in: {trainer.logger.log_dir}")
+
+    for name, callback in checkpoints_to_process:
+        ckpt_path = callback.best_model_path
+
+        # ROBUST SAFETY CHECK
+        if ckpt_path and os.path.isfile(ckpt_path):
+            print(f"\n>>> PROCESSING: {name}")
+            print(f"    Checkpoint: {ckpt_path}")
+
+            # A. Test Metrics (Numerical)
+            try:
+                print("    Running numerical test...")
+                trainer.test(dataloaders=dataloaders["test"], ckpt_path=ckpt_path)
+            except Exception as e:
+                print(f"    [Error] Numerical testing failed: {e}")
+
+            # B. Generate Heatmaps (Visual)
+            run_heatmap_generation(
+                ckpt_path=ckpt_path,
+                output_name=name,
+                version_dir=heatmap_version_dir,
+            )
+        else:
+            print(f"\n>>> SKIPPING: {name}")
+            if not ckpt_path:
+                print("    Reason: No checkpoint was saved (metric likely never improved).")
+            else:
+                print(f"    Reason: File not found at '{ckpt_path}'")
+
     print("\n" + "="*60)
     print("✅ ALL DONE! Training, Testing, and Heatmap Generation Complete!")
-    print("="*60)
-    print(f"📁 Heatmaps saved in: {heatmaps_base_dir / version}")
-    print(f"   Structure:")
-    print(f"   - {version}/best-auc/    (Best AUC model heatmaps)")
-    print(f"   - {version}/best-f1/      (Best F1 model heatmaps)")
-    print(f"   - {version}/best-loss/    (Best Loss model heatmaps)")
-    print("="*60)
+    print("="*40)
+    print(f"📁 Heatmaps saved in: {heatmap_version_dir}")
+    print("   Structure:")
+    print("   - best_auc_model/   (Best AUC model heatmaps)")
+    print("   - best_f1_model/    (Best F1 model heatmaps)")
+    print("   - best_loss_model/  (Best Loss model heatmaps)")
+    print("="*40)
 
 
 if __name__ == "__main__":

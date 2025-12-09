@@ -35,7 +35,8 @@ model:
   pretrained: true
   dropout: 0.2
   num_classes: 2
-  class_weights: null  # REMOVED: Focal Loss handles imbalance - extreme weights cause gradient explosion
+  class_weights: null
+    # REMOVED: Focal Loss handles imbalance - extreme weights cause gradient explosion
 
 loss:
   name: focal

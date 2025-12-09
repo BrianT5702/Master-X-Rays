@@ -7,7 +7,7 @@ data:
   chexpert_root: "datasets/Standford ML Group X-Rays Chest Master Datasets/cheXphoto-master/cheXphoto-master"
   csv_path: "datasets/NIH Chest X-Rays Master Datasets/archive/Data_Entry_2017.csv"
   image_size: [224, 224]
-  num_workers: 4  # Reduced: 6 workers + path cache = optimal balance (glob was the bottleneck!)
+  num_workers: 4 
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
@@ -21,7 +21,7 @@ augmentations:
 
 training:
   batch_size: 32  # Larger batch size for GPU (can increase if you have more VRAM)
-  max_epochs: 25
+  max_epochs: 40
   precision: "16-mixed"  # Mixed precision for faster training on GPU
   optimizer: adamw
   learning_rate: 0.00005  # Further reduced: extreme imbalance needs very careful learning

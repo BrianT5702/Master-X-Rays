@@ -24,6 +24,7 @@ import yaml
 from src.data.datasets import create_dataloaders
 from src.models.basemodels import build_backbone
 from src.training.lightning_module import RareDiseaseModule
+from scripts.generate_visualizations import generate_heatmaps_for_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,7 +173,7 @@ def main() -> None:
         log_every_n_steps=10,
         callbacks=[checkpoint_auc, checkpoint_f1, checkpoint_loss],  # Add callbacks here
     )
-    
+
     # 1. RUN TRAINING
     trainer.fit(
         lightning_module,
@@ -205,6 +206,87 @@ def main() -> None:
         trainer.test(dataloaders=dataloaders["test"], ckpt_path=checkpoint_loss.best_model_path)
     else:
         print("\n>>> Warning: No Best Loss checkpoint found.")
+    
+    # 3. GENERATE HEATMAPS AUTOMATICALLY (Best Models)
+    print("\n" + "="*60)
+    print("GENERATING GRAD-CAM HEATMAPS FOR BEST MODELS")
+    print("="*60)
+    
+    # Generate version identifier from timestamp
+    from datetime import datetime
+    version = f"version_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Base output directory for all heatmaps
+    heatmaps_base_dir = PROJECT_ROOT / "outputs" / "heatmaps"
+    heatmaps_base_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"📁 Using version folder: {version}")
+    print(f"   Structure: outputs/heatmaps/{version}/[best-auc|best-f1|best-loss]/")
+    print()
+    
+    # Generate heatmaps for Best AUC Model
+    if checkpoint_auc.best_model_path:
+        print(f"\n>>> Generating heatmaps for Best AUC Model...")
+        generate_heatmaps_for_checkpoint(
+            checkpoint_path=Path(checkpoint_auc.best_model_path),
+            config_path=args.config,
+            output_dir=heatmaps_base_dir,
+            model_type="best-auc",
+            version=version,
+            batch_size=16,
+            num_samples=32,
+            target_class=None,  # Auto (highest prediction)
+            method="gradcam++",
+            num_workers=0,  # Windows compatibility
+        )
+    else:
+        print("\n>>> Skipping heatmap generation for Best AUC (checkpoint not found).")
+    
+    # Generate heatmaps for Best F1 Model (Most important for your thesis)
+    if checkpoint_f1.best_model_path:
+        print(f"\n>>> Generating heatmaps for Best F1 Model...")
+        generate_heatmaps_for_checkpoint(
+            checkpoint_path=Path(checkpoint_f1.best_model_path),
+            config_path=args.config,
+            output_dir=heatmaps_base_dir,
+            model_type="best-f1",
+            version=version,
+            batch_size=16,
+            num_samples=32,
+            target_class=None,  # Auto (highest prediction)
+            method="gradcam++",
+            num_workers=0,  # Windows compatibility
+        )
+    else:
+        print("\n>>> Skipping heatmap generation for Best F1 (checkpoint not found).")
+    
+    # Generate heatmaps for Best Loss Model
+    if checkpoint_loss.best_model_path:
+        print(f"\n>>> Generating heatmaps for Best Loss Model...")
+        generate_heatmaps_for_checkpoint(
+            checkpoint_path=Path(checkpoint_loss.best_model_path),
+            config_path=args.config,
+            output_dir=heatmaps_base_dir,
+            model_type="best-loss",
+            version=version,
+            batch_size=16,
+            num_samples=32,
+            target_class=None,  # Auto (highest prediction)
+            method="gradcam++",
+            num_workers=0,  # Windows compatibility
+        )
+    else:
+        print("\n>>> Skipping heatmap generation for Best Loss (checkpoint not found).")
+    
+    print("\n" + "="*60)
+    print("✅ ALL DONE! Training, Testing, and Heatmap Generation Complete!")
+    print("="*60)
+    print(f"📁 Heatmaps saved in: {heatmaps_base_dir / version}")
+    print(f"   Structure:")
+    print(f"   - {version}/best-auc/    (Best AUC model heatmaps)")
+    print(f"   - {version}/best-f1/      (Best F1 model heatmaps)")
+    print(f"   - {version}/best-loss/    (Best Loss model heatmaps)")
+    print("="*60)
 
 
 if __name__ == "__main__":

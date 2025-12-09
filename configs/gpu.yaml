@@ -21,10 +21,10 @@ augmentations:
 
 training:
   batch_size: 32  # Larger batch size for GPU (can increase if you have more VRAM)
-  max_epochs: 50
+  max_epochs: 60
   precision: "16-mixed"  # Mixed precision for faster training on GPU
   optimizer: adamw
-  learning_rate: 0.0001  # Reduced from 0.0003 - lower LR for better convergence with extreme imbalance
+  learning_rate: 0.00005  # Further reduced: extreme imbalance needs very careful learning
   weight_decay: 0.01
   scheduler: cosine
   warmup_epochs: 5
@@ -35,7 +35,7 @@ model:
   pretrained: true
   dropout: 0.2
   num_classes: 2
-  class_weights: [16.71, 65.50]  # [Nodule, Fibrosis] - balances extreme class imbalance
+  class_weights: null  # REMOVED: Focal Loss handles imbalance - extreme weights cause gradient explosion
 
 loss:
   name: focal

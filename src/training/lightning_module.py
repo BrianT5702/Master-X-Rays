@@ -202,6 +202,23 @@ class RareDiseaseModule(LightningModule):
             # Reset for next epoch
             self.val_f1_per_class.reset()
             self.val_auc_per_class.reset()
+        
+        # Diagnostic: Check if model is predicting any positives (critical for rare diseases)
+        if stage in ["val", "test"]:
+            binary_preds = (preds > self.prediction_threshold).float()
+            num_positives = binary_preds.sum().item()
+            total_samples = binary_preds.numel()
+            positive_rate = num_positives / total_samples if total_samples > 0 else 0.0
+            self.log(f"{stage}_positive_rate", positive_rate, prog_bar=False, on_epoch=True)
+            
+            # Log actual vs predicted positives for each class
+            for i, class_name in enumerate(["Nodule", "Fibrosis"]):
+                class_preds = binary_preds[:, i]
+                class_labels = labels[:, i]
+                predicted_pos = class_preds.sum().item()
+                actual_pos = class_labels.sum().item()
+                self.log(f"{stage}_pred_{class_name}", predicted_pos, prog_bar=False, on_epoch=True)
+                self.log(f"{stage}_actual_{class_name}", actual_pos, prog_bar=False, on_epoch=True)
 
         return loss
 

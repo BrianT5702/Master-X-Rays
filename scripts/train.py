@@ -83,7 +83,11 @@ def main() -> None:
         dropout=model_cfg.get("dropout", 0.0),
     )
     # Optional speedup (PyTorch 2.x): compile model for RTX 3000+
+    # Guarded: skip if Triton/Inductor is not available/working (common on Windows)
     try:
+        import importlib
+        if importlib.util.find_spec("triton") is None:
+            raise ImportError("triton not available; skipping torch.compile")
         model = torch.compile(model, mode="max-autotune")
         print("✅ torch.compile enabled")
     except Exception as e:

@@ -20,7 +20,8 @@ augmentations:
   use_gan_synthetic: false
 
 training:
-  batch_size: 32  # Larger batch size for GPU (can increase if you have more VRAM)
+  batch_size: 32
+  accumulate_grad_batches: 2  # Larger batch size for GPU (can increase if you have more VRAM)
   max_epochs: 50
   precision: "16-mixed"  # Mixed precision for faster training on GPU
   optimizer: adamw

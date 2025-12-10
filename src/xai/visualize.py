@@ -43,7 +43,7 @@ def visualize_heatmap(
 
     # Convert heatmap to numpy
     if isinstance(heatmap, torch.Tensor):
-        heatmap = heatmap.cpu().numpy()
+        heatmap = heatmap.detach().cpu().numpy()
 
     # Resize heatmap to match image if needed
     if heatmap.shape != image.shape[:2]:
@@ -55,7 +55,7 @@ def visualize_heatmap(
             mode='bilinear',
             align_corners=False
         )
-        heatmap = heatmap_tensor.squeeze().numpy()
+        heatmap = heatmap_tensor.squeeze().detach().numpy()
 
     # Create figure
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))

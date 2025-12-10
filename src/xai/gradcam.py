@@ -29,11 +29,16 @@ class GradCAM:
 
     def _save_activation(self, module, input, output) -> None:
         """Save activation maps."""
-        self.activations = output
+        # Clone to avoid in-place operation conflicts (e.g., DenseNet uses in-place ReLU)
+        self.activations = output.clone() if isinstance(output, torch.Tensor) else output
 
     def _save_gradient(self, module, grad_input, grad_output) -> None:
         """Save gradients."""
-        self.gradients = grad_output[0]
+        # Clone to avoid in-place operation conflicts
+        if grad_output and len(grad_output) > 0:
+            self.gradients = grad_output[0].clone() if isinstance(grad_output[0], torch.Tensor) else grad_output[0]
+        else:
+            self.gradients = None
 
     def generate(
         self, input_tensor: torch.Tensor, target_class: Optional[int] = None
@@ -51,8 +56,20 @@ class GradCAM:
         self.model.eval()
         input_tensor.requires_grad_(True)
 
-        # Forward pass
-        output = self.model(input_tensor)
+        # Temporarily patch F.relu to disable inplace for DenseNet compatibility
+        original_relu = F.relu
+        def relu_no_inplace(input, inplace=False):
+            return original_relu(input, inplace=False)
+        
+        # Monkey-patch F.relu temporarily
+        F.relu = relu_no_inplace
+
+        try:
+            # Forward pass
+            output = self.model(input_tensor)
+        finally:
+            # Restore original F.relu
+            F.relu = original_relu
 
         # Determine target class
         if target_class is None:
@@ -108,8 +125,20 @@ class GradCAMPlusPlus(GradCAM):
         self.model.eval()
         input_tensor.requires_grad_(True)
 
-        # Forward pass
-        output = self.model(input_tensor)
+        # Temporarily patch F.relu to disable inplace for DenseNet compatibility
+        original_relu = F.relu
+        def relu_no_inplace(input, inplace=False):
+            return original_relu(input, inplace=False)
+        
+        # Monkey-patch F.relu temporarily
+        F.relu = relu_no_inplace
+
+        try:
+            # Forward pass
+            output = self.model(input_tensor)
+        finally:
+            # Restore original F.relu
+            F.relu = original_relu
 
         # Determine target class
         if target_class is None:

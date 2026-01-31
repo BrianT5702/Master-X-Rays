@@ -20,11 +20,11 @@ torch.set_float32_matmul_precision('medium')  # 'medium' = good balance, 'high' 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 import yaml
+import subprocess
 
 from src.data.datasets import create_dataloaders
 from src.models.basemodels import build_backbone
 from src.training.lightning_module import RareDiseaseModule
-from scripts.generate_visualizations import generate_heatmaps_for_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("configs/base.yaml"), help="Path to YAML config.")
     parser.add_argument("--accelerator", type=str, default="auto", help="PyTorch Lightning accelerator.")
     parser.add_argument("--devices", type=int, default=1, help="Number of devices to use.")
+    # No checkpoint argument: always start a fresh run
     return parser.parse_args()
 
 
@@ -56,7 +57,11 @@ def main() -> None:
 
     augmentation_config = config.get("augmentations", {})
     use_weighted_sampling = training_cfg.get("use_weighted_sampling", False)
-    patient_split = data_cfg.get("patient_split", False)
+    use_roi_extraction = data_cfg.get("use_roi_extraction", True)
+    patient_split = data_cfg.get("patient_split", True)
+    cache_dir = data_cfg.get("cache_dir", None)
+    if cache_dir:
+        cache_dir = Path(cache_dir)
     
     dataloaders = create_dataloaders(
         csv_path=csv_path,
@@ -74,38 +79,32 @@ def main() -> None:
         augmentation_config=augmentation_config,
         use_weighted_sampling=use_weighted_sampling,
         patient_split=patient_split,
+        use_roi_extraction=use_roi_extraction,
+        cache_dir=cache_dir,
     )
 
-    model = build_backbone(
+    # Build model architecture
+    backbone = build_backbone(
         model_cfg["backbone"],
         num_classes=model_cfg["num_classes"],
         pretrained=model_cfg["pretrained"],
-        dropout=model_cfg.get("dropout", 0.0),
     )
-    # Optional speedup (PyTorch 2.x): compile model for RTX 3000+
-    # Guarded: skip if Triton/Inductor is not available/working (common on Windows)
-    try:
-        import importlib
-        if importlib.util.find_spec("triton") is None:
-            raise ImportError("triton not available; skipping torch.compile")
-        model = torch.compile(model, mode="max-autotune")
-        print("✅ torch.compile enabled")
-    except Exception as e:
-        print(f"⚠️ torch.compile skipped: {e}")
+    
     # Get prediction threshold from config (default 0.3 for imbalanced rare disease detection)
     prediction_threshold = training_cfg.get("prediction_threshold", 0.3)
+    class_weights = model_cfg.get("class_weights", None)  # Optional: ASL handles imbalance internally
     
-    samples_per_class = model_cfg.get("samples_per_class", None)
-    
+    # Always start a fresh LightningModule for a new training run
+    print("🆕 Starting new training run (no checkpoint resumption)")
     lightning_module = RareDiseaseModule(
-        model=model,
+        model=backbone,
         learning_rate=training_cfg["learning_rate"],
         weight_decay=training_cfg["weight_decay"],
-        class_weights=model_cfg["class_weights"],
+        class_weights=class_weights,
         loss_config=loss_cfg,
         max_epochs=training_cfg["max_epochs"],
         prediction_threshold=prediction_threshold,
-        samples_per_class=samples_per_class,
+        samples_per_class=None,
     )
 
     # Auto-detect GPU, fall back to CPU if not available
@@ -140,141 +139,103 @@ def main() -> None:
     else:
         precision = training_cfg["precision"]  # Use config precision for GPU
 
-    # --- CHECKPOINT CALLBACKS ---
-    # Let PL place checkpoints in the logger directory (lightning_logs/version_x/checkpoints)
-    checkpoint_auc = ModelCheckpoint(
-        filename="best-auc-{epoch:02d}-{val_auc:.4f}",
-        monitor="val_auc",
-        mode="max",
-        save_top_k=1,
-        save_last=False,
-    )
+    # Gradient accumulation for high-resolution training (320x320)
+    # Allows effective larger batch size when GPU memory is limited
+    accumulate_grad_batches = training_cfg.get("accumulate_grad_batches", 1)
     
+    # Model checkpointing:
+    # - Primary: governed by Macro-Averaged F1-Score (per thesis)
+    # - Secondary: also track best AUROC and best validation loss for analysis
     checkpoint_f1 = ModelCheckpoint(
-        filename="best-f1-{epoch:02d}-{val_f1:.4f}",
         monitor="val_f1",
         mode="max",
+        filename="best-f1-{epoch:02d}-{val_f1:.4f}",
+        save_top_k=1,
+        save_last=True,
+    )
+    checkpoint_auc = ModelCheckpoint(
+        monitor="val_auc",
+        mode="max",
+        filename="best-auc-{epoch:02d}-{val_auc:.4f}",
+        save_top_k=1,
+        save_last=False,
+    )
+    checkpoint_loss = ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
+        filename="best-loss-{epoch:02d}-{val_loss:.4f}",
         save_top_k=1,
         save_last=False,
     )
     
-    checkpoint_loss = ModelCheckpoint(
-        filename="best-loss-{epoch:02d}-{val_loss:.4f}",
-        monitor="val_loss",
-        mode="min",
-        save_top_k=1,
-        save_last=False,
-    )
-
+    # Explicitly disable early stopping - train for full max_epochs
+    # No EarlyStopping callback is added, so training will run for all epochs
     trainer = pl.Trainer(
         max_epochs=training_cfg["max_epochs"],
         accelerator=accelerator,
         devices=args.devices,
         precision=precision,
         log_every_n_steps=10,
-        default_root_dir=str(PROJECT_ROOT),  # ensure logger/checkpoints under project root
-        callbacks=[checkpoint_auc, checkpoint_f1, checkpoint_loss],  # Add callbacks here
+        accumulate_grad_batches=accumulate_grad_batches,
+        callbacks=[checkpoint_f1, checkpoint_auc, checkpoint_loss],
+        enable_progress_bar=True,
     )
 
-    # 1. RUN TRAINING
     trainer.fit(
         lightning_module,
         train_dataloaders=dataloaders["train"],
         val_dataloaders=dataloaders["val"],
     )
+    trainer.test(lightning_module, dataloaders["test"])
     
-    # Helper for heatmaps
-    def run_heatmap_generation(
-        ckpt_path: str,
-        output_name: str,
-        version_dir: Path,
-    ) -> None:
-        try:
-            generate_heatmaps_for_checkpoint(
-                checkpoint_path=Path(ckpt_path),
-                config_path=args.config,
-                output_dir=Path("outputs") / "heatmaps",
-                model_type=output_name,
-                version=version_dir.name,
-                batch_size=16,
-                num_samples=32,
-                target_class=None,
-                method="gradcam++",
-                num_workers=0,
-            )
-        except Exception as e:
-            print(f"    [Error] Heatmap generation failed for {output_name}: {e}")
-            import traceback
-            traceback.print_exc()
-
-    print("\n" + "="*50)
-    print("TRAINING COMPLETE. STARTING EVALUATION & VISUALIZATION.")
-    print("="*50)
-
-    # 1. Setup Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 2. Get Version Info (Matches lightning_logs/version_X)
-    try:
-        version = trainer.logger.version if trainer.logger else "unknown"
-    except Exception:
-        version = "unknown"
-
-    version_str = f"version_{version}"
-    print(f"[*] Current Run Version: {version_str}")
-
-    # 3. Setup Heatmap Directory: outputs/heatmaps/version_X
-    heatmap_version_dir = Path("outputs") / "heatmaps" / version_str
-    heatmap_version_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[*] Heatmaps will be saved to: {heatmap_version_dir}")
-
-    checkpoints_to_process = [
-        ("best_auc_model", checkpoint_auc),
-        ("best_f1_model", checkpoint_f1),
-        ("best_loss_model", checkpoint_loss),
-    ]
-
-    # Helper to print where files actually went
-    if trainer.logger and trainer.logger.log_dir:
-        print(f"[*] Artifacts are saved in: {trainer.logger.log_dir}")
-
-    for name, callback in checkpoints_to_process:
-        ckpt_path = callback.best_model_path
-
-        # ROBUST SAFETY CHECK
-        if ckpt_path and os.path.isfile(ckpt_path):
-            print(f"\n>>> PROCESSING: {name}")
-            print(f"    Checkpoint: {ckpt_path}")
-
-            # A. Test Metrics (Numerical)
-            try:
-                print("    Running numerical test...")
-                trainer.test(dataloaders=dataloaders["test"], ckpt_path=ckpt_path)
-            except Exception as e:
-                print(f"    [Error] Numerical testing failed: {e}")
-
-            # B. Generate Heatmaps (Visual)
-            run_heatmap_generation(
-                ckpt_path=ckpt_path,
-                output_name=name,
-                version_dir=heatmap_version_dir,
-            )
-        else:
-            print(f"\n>>> SKIPPING: {name}")
-            if not ckpt_path:
-                print("    Reason: No checkpoint was saved (metric likely never improved).")
-            else:
-                print(f"    Reason: File not found at '{ckpt_path}'")
-
+    # Generate heatmaps automatically after training completes
     print("\n" + "="*60)
-    print("✅ ALL DONE! Training, Testing, and Heatmap Generation Complete!")
-    print("="*40)
-    print(f"📁 Heatmaps saved in: {heatmap_version_dir}")
-    print("   Structure:")
-    print("   - best_auc_model/   (Best AUC model heatmaps)")
-    print("   - best_f1_model/    (Best F1 model heatmaps)")
-    print("   - best_loss_model/  (Best Loss model heatmaps)")
-    print("="*40)
+    print("Training completed! Generating heatmaps...")
+    print("="*60)
+    
+    # Get the best checkpoint path
+    # Use best AUC checkpoint for heatmaps (better metric for rare disease detection)
+    # Fallback to best F1 if AUC checkpoint not available
+    best_checkpoint = checkpoint_auc.best_model_path if checkpoint_auc.best_model_path else checkpoint_f1.best_model_path
+    if checkpoint_auc.best_model_path:
+        print(f"📊 Using best AUC checkpoint (val_auc={checkpoint_auc.best_model_score:.4f})")
+    else:
+        print(f"📊 Using best F1 checkpoint (val_f1={checkpoint_f1.best_model_score:.4f})")
+    if best_checkpoint:
+        # Convert to absolute path if relative
+        if not Path(best_checkpoint).is_absolute():
+            best_checkpoint = Path(best_checkpoint).resolve()
+        else:
+            best_checkpoint = Path(best_checkpoint)
+        
+        print(f"Using best checkpoint: {best_checkpoint}")
+        
+        # Generate heatmaps for test set
+        heatmap_script = PROJECT_ROOT / "scripts" / "generate_heatmaps.py"
+        if heatmap_script.exists():
+            try:
+                # Use sys.executable to ensure we use the same Python interpreter
+                # This fixes ModuleNotFoundError when subprocess uses different Python
+                subprocess.run([
+                    sys.executable, str(heatmap_script),
+                    "--checkpoint", str(best_checkpoint),
+                    "--config", str(args.config),
+                    "--split", "test",
+                    "--num_samples", "20",
+                    "--output_dir", str(PROJECT_ROOT / "heatmaps"),
+                ], check=True, cwd=str(PROJECT_ROOT))
+                print(f"\n✅ Heatmaps generated successfully!")
+                print(f"   Location: {PROJECT_ROOT / 'heatmaps' / 'test' / 'gradcam'}")
+            except subprocess.CalledProcessError as e:
+                print(f"\n⚠️  Warning: Failed to generate heatmaps: {e}")
+                print("   You can generate them manually using:")
+                print(f"   python scripts/generate_heatmaps.py --checkpoint {best_checkpoint} --config {args.config}")
+        else:
+            print(f"\n⚠️  Warning: Heatmap script not found at {heatmap_script}")
+    else:
+        print("\n⚠️  Warning: No best checkpoint found. Heatmaps not generated.")
+        print("   You can generate them manually using:")
+        print("   python scripts/generate_heatmaps.py --checkpoint <checkpoint_path> --config <config_path>")
 
 
 if __name__ == "__main__":

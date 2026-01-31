@@ -36,6 +36,58 @@ def focal_loss(
     return focal_loss
 
 
+def asymmetric_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma_neg: float = 4.0,
+    gamma_pos: float = 1.0,
+    clip: float = 0.2,
+    eps: float = 1e-8,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Asymmetric Loss (ASL) for multi-label classification with extreme class imbalance.
+    
+    Reference: "Asymmetric Loss For Multi-Label Classification" by Ben-Baruch et al., ICCV 2021.
+    
+    ASL decouples the gradient contribution of positive and negative samples, applying
+    hard thresholding to easy negatives to prevent gradient suppression from dominating
+    the rare positive class learning signal.
+    
+    Args:
+        logits: Raw model outputs (before sigmoid), shape (B, C)
+        targets: Binary target labels, shape (B, C)
+        gamma_neg: Focusing parameter for negative samples (default: 4.0)
+        gamma_pos: Focusing parameter for positive samples (default: 1.0)
+        clip: Probability margin for hard thresholding negatives (default: 0.2 for extreme imbalance)
+        eps: Small epsilon for numerical stability
+        reduction: 'mean' or 'none'
+    
+    Returns:
+        Asymmetric loss tensor
+    """
+    probs = torch.sigmoid(logits)
+    
+    # Positive samples: standard focal loss
+    pt_pos = probs * targets
+    pt_neg = (1 - probs) * (1 - targets)
+    
+    # Asymmetric focusing: different gamma for positive and negative
+    # Positive: (1 - pt)^gamma_pos
+    # Negative: (pt)^gamma_neg with hard thresholding
+    pt_neg = torch.clamp(pt_neg, max=1 - clip)
+    
+    # Compute asymmetric loss components
+    loss_pos = -targets * torch.log(pt_pos + eps) * torch.pow(1 - pt_pos, gamma_pos)
+    loss_neg = -(1 - targets) * torch.log(1 - pt_neg + eps) * torch.pow(pt_neg, gamma_neg)
+    
+    loss = loss_pos + loss_neg
+    
+    if reduction == "mean":
+        return loss.mean()
+    return loss
+
+
 def class_balanced_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -108,7 +160,6 @@ class RareDiseaseModule(LightningModule):
         if num_classes is None:
             raise ValueError("Model must expose `num_classes` attribute for metrics initialization.")
 
-        # Macro-averaged metrics (overall performance)
         self.train_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=prediction_threshold)
         self.val_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=prediction_threshold)
         self.test_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=prediction_threshold)
@@ -118,10 +169,6 @@ class RareDiseaseModule(LightningModule):
 
         self.val_acc = MultilabelAccuracy(num_labels=num_classes, average="macro")
         self.test_acc = MultilabelAccuracy(num_labels=num_classes, average="macro")
-        
-        # Per-class metrics for diagnosis (to see which class is failing)
-        self.val_f1_per_class = MultilabelF1Score(num_labels=num_classes, average="none", threshold=prediction_threshold)
-        self.val_auc_per_class = MultilabelAUROC(num_labels=num_classes, average="none")
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return self.model(images)
@@ -139,9 +186,17 @@ class RareDiseaseModule(LightningModule):
         logits = self(images)
 
         # Select loss function based on config
-        loss_name = self.loss_config.get("name", "bce")
+        loss_name = self.loss_config.get("name", "asymmetric")
         
-        if loss_name == "focal":
+        if loss_name == "asymmetric" or loss_name == "asl":
+            # Asymmetric Loss (ASL) - recommended for extreme class imbalance
+            gamma_neg = self.loss_config.get("gamma_neg", 4.0)
+            gamma_pos = self.loss_config.get("gamma_pos", 1.0)
+            clip = self.loss_config.get("clip", 0.2)
+            loss = asymmetric_loss(
+                logits, labels, gamma_neg=gamma_neg, gamma_pos=gamma_pos, clip=clip, reduction="mean"
+            )
+        elif loss_name == "focal":
             alpha = self.loss_config.get("alpha", 0.75)
             gamma = self.loss_config.get("gamma", 2.0)
             # Compute focal loss per element (reduction="none")
@@ -189,36 +244,6 @@ class RareDiseaseModule(LightningModule):
             self.log(f"{stage}_auc", metrics["auc"], prog_bar=True, on_epoch=True)
         if metrics["acc"] is not None:
             self.log(f"{stage}_acc", metrics["acc"], prog_bar=False, on_epoch=True)
-        
-        # Log per-class metrics for validation to diagnose issues
-        if stage == "val":
-            self.val_f1_per_class(preds, labels.int())
-            self.val_auc_per_class(preds, labels.int())
-            f1_per_class = self.val_f1_per_class.compute()
-            auc_per_class = self.val_auc_per_class.compute()
-            for i, class_name in enumerate(["Nodule", "Fibrosis"]):
-                self.log(f"val_f1_{class_name}", f1_per_class[i], prog_bar=False, on_epoch=True)
-                self.log(f"val_auc_{class_name}", auc_per_class[i], prog_bar=False, on_epoch=True)
-            # Reset for next epoch
-            self.val_f1_per_class.reset()
-            self.val_auc_per_class.reset()
-        
-        # Diagnostic: Check if model is predicting any positives (critical for rare diseases)
-        if stage in ["val", "test"]:
-            binary_preds = (preds > self.prediction_threshold).float()
-            num_positives = binary_preds.sum().item()
-            total_samples = binary_preds.numel()
-            positive_rate = num_positives / total_samples if total_samples > 0 else 0.0
-            self.log(f"{stage}_positive_rate", positive_rate, prog_bar=False, on_epoch=True)
-            
-            # Log actual vs predicted positives for each class
-            for i, class_name in enumerate(["Nodule", "Fibrosis"]):
-                class_preds = binary_preds[:, i]
-                class_labels = labels[:, i]
-                predicted_pos = class_preds.sum().item()
-                actual_pos = class_labels.sum().item()
-                self.log(f"{stage}_pred_{class_name}", predicted_pos, prog_bar=False, on_epoch=True)
-                self.log(f"{stage}_actual_{class_name}", actual_pos, prog_bar=False, on_epoch=True)
 
         return loss
 

@@ -6,41 +6,43 @@ data:
   nih_root: "datasets/NIH Chest X-Rays Master Datasets/archive"
   chexpert_root: "datasets/Standford ML Group X-Rays Chest Master Datasets/cheXphoto-master/cheXphoto-master"
   csv_path: "datasets/NIH Chest X-Rays Master Datasets/archive/Data_Entry_2017.csv"
-  image_size: [224, 224]
-  num_workers: 4 
+  image_size: [320, 320]  # High-resolution input to preserve spatial fidelity of small nodules
+  num_workers: 3  # Optimal for stability - 4 workers pushed memory to 94-96% (too risky)
+  cache_dir: "datasets/cache"  # Pre-processed images cache (set to null to disable)
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
-  patient_split: true
+  patient_split: true  # Patient-level splitting to prevent data leakage
+  use_roi_extraction: true  # Will be disabled automatically if cache_dir is set
 
 augmentations:
   horizontal_flip_prob: 0.5
-  rotation_degrees: 7.5
+  rotation_degrees: 10.0  # Limited to ±10° for anatomical plausibility (per thesis)
   random_noise_std: 0.01
   use_gan_synthetic: false
+  # Random Resized Crop (scale 0.8-1.0) is applied automatically in dataset
 
 training:
-  batch_size: 32
-  accumulate_grad_batches: 2  # Larger batch size for GPU (can increase if you have more VRAM)
-  max_epochs: 50
-  precision: "16-mixed"  # Mixed precision for faster training on GPU
+  batch_size: 24  # Reduced to save memory (16GB RAM limit)
+  max_epochs: 25
+  precision: "16-mixed"  # Mixed precision for faster training on GPU (saves VRAM)
+  accumulate_grad_batches: 2  # Increased to maintain effective batch size = 48 (24 * 2)
   optimizer: adamw
-  learning_rate: 0.00005  # Further reduced: extreme imbalance needs very careful learning
+  learning_rate: 0.0001
   weight_decay: 0.01
   scheduler: cosine
   warmup_epochs: 5
-  use_weighted_sampling: false  # Can enable for better class balance
-  prediction_threshold: 0.25  # Raise threshold to reduce Nodule false positives
+  use_weighted_sampling: false  # ASL handles imbalance, sampling not needed
 
 model:
   backbone: densenet121
   pretrained: true
   dropout: 0.2
   num_classes: 2
-  class_weights: null
-    # REMOVED: Focal Loss handles imbalance - extreme weights cause gradient explosion
+  # Class weights not needed with ASL (it handles imbalance internally)
 
 loss:
-  name: focal
-  alpha: 0.25
-  gamma: 2.0
+  name: asymmetric  # Asymmetric Loss (ASL) for extreme class imbalance
+  gamma_neg: 4.0  # Focusing parameter for negative samples
+  gamma_pos: 1.0  # Focusing parameter for positive samples
+  clip: 0.2  # Probability margin for hard thresholding negatives (per thesis: p < 0.2)

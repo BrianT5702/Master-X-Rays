@@ -96,6 +96,7 @@ def main() -> None:
     
     # Always start a fresh LightningModule for a new training run
     print("🆕 Starting new training run (no checkpoint resumption)")
+    warmup_epochs = training_cfg.get("warmup_epochs", 0)
     lightning_module = RareDiseaseModule(
         model=backbone,
         learning_rate=training_cfg["learning_rate"],
@@ -105,6 +106,7 @@ def main() -> None:
         max_epochs=training_cfg["max_epochs"],
         prediction_threshold=prediction_threshold,
         samples_per_class=None,
+        warmup_epochs=warmup_epochs,
     )
 
     # Auto-detect GPU, fall back to CPU if not available
@@ -146,6 +148,7 @@ def main() -> None:
     # Model checkpointing:
     # - Primary: governed by Macro-Averaged F1-Score (per thesis)
     # - Secondary: also track best AUROC and best validation loss for analysis
+    # - Periodic: save every 2 epochs to prevent data loss from crashes
     checkpoint_f1 = ModelCheckpoint(
         monitor="val_f1",
         mode="max",
@@ -167,6 +170,13 @@ def main() -> None:
         save_top_k=1,
         save_last=False,
     )
+    # Periodic checkpoint: save every 2 epochs to prevent data loss from crashes
+    checkpoint_periodic = ModelCheckpoint(
+        filename="epoch-{epoch:02d}",
+        every_n_epochs=2,
+        save_top_k=-1,  # Keep all periodic checkpoints
+        save_last=False,
+    )
     
     # Explicitly disable early stopping - train for full max_epochs
     # No EarlyStopping callback is added, so training will run for all epochs
@@ -177,7 +187,7 @@ def main() -> None:
         precision=precision,
         log_every_n_steps=10,
         accumulate_grad_batches=accumulate_grad_batches,
-        callbacks=[checkpoint_f1, checkpoint_auc, checkpoint_loss],
+        callbacks=[checkpoint_f1, checkpoint_auc, checkpoint_loss, checkpoint_periodic],
         enable_progress_bar=True,
     )
 

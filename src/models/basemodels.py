@@ -7,12 +7,19 @@ import torchvision.models as tv_models
 
 
 def build_backbone(
-    name: Literal["densenet121", "resnet50", "swin_t"], num_classes: int, pretrained: bool = True
+    name: Literal["densenet121", "resnet50", "swin_t"], num_classes: int, pretrained: bool = True, dropout: float = 0.0
 ) -> torch.nn.Module:
     if name == "densenet121":
         model = tv_models.densenet121(weights="DEFAULT" if pretrained else None)
         in_features = model.classifier.in_features
-        model.classifier = torch.nn.Linear(in_features, num_classes)
+        # Add dropout before classifier to reduce overfitting
+        if dropout > 0:
+            model.classifier = torch.nn.Sequential(
+                torch.nn.Dropout(dropout),
+                torch.nn.Linear(in_features, num_classes)
+            )
+        else:
+            model.classifier = torch.nn.Linear(in_features, num_classes)
     elif name == "resnet50":
         model = tv_models.resnet50(weights="DEFAULT" if pretrained else None)
         in_features = model.fc.in_features

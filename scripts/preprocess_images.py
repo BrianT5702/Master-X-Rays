@@ -67,20 +67,31 @@ def preprocess_images(
         print(f"   Removed {initial_count - len(metadata):,} lateral/oblique views")
         print(f"   Remaining images: {len(metadata):,}")
     
-    # Filter for specific labels if provided
+    # For multi-label classification: Include ALL images
+    # Positive cases: Images with target labels (Nodule/Fibrosis)
+    # Negative cases: Images WITHOUT target labels (includes "No Finding" AND other diseases)
+    # This is correct for multi-label classification - other diseases are valid negatives
     if label_columns:
-        print(f"[INFO] Filtering for labels: {label_columns}")
+        print(f"[INFO] Processing all images for multi-label classification")
+        print(f"   Target labels: {label_columns}")
+        print(f"   Positive cases: Images WITH {label_columns}")
+        print(f"   Negative cases: Images WITHOUT {label_columns} (includes other diseases)")
+        print(f"   Total images to process: {len(metadata):,}")
+        # Create binary labels for all images (will be used during training)
         for label in label_columns:
             metadata[label] = (
                 metadata["Finding Labels"]
                 .str.contains(label, regex=False, na=False)
                 .astype(int)
             )
-        # Keep images with at least one target label OR "No Finding"
+        # Count statistics
         has_target = metadata[label_columns].any(axis=1)
-        has_no_finding = metadata["Finding Labels"].str.contains("No Finding", regex=False, na=False)
-        metadata = metadata[has_target | has_no_finding].copy()
-        print(f"   Filtered to {len(metadata):,} images")
+        positive_count = has_target.sum()
+        negative_count = len(metadata) - positive_count
+        print(f"   Positive cases (with target labels): {positive_count:,}")
+        print(f"   Negative cases (without target labels): {negative_count:,}")
+        # Keep ALL images - no filtering
+        # metadata = metadata.copy()  # Already have all images, no need to filter
     
     # Create cache directory structure
     cache_dir.mkdir(parents=True, exist_ok=True)

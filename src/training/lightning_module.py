@@ -141,6 +141,7 @@ class RareDiseaseModule(LightningModule):
         max_epochs: int = 50,
         prediction_threshold: float = 0.3,
         samples_per_class: Optional[Iterable[float]] = None,
+        warmup_epochs: int = 0,
     ) -> None:
         super().__init__()
         self.model = model
@@ -155,6 +156,7 @@ class RareDiseaseModule(LightningModule):
         self.loss_config = loss_config or {"name": "bce"}
         self.max_epochs = max_epochs
         self.prediction_threshold = prediction_threshold
+        self.warmup_epochs = warmup_epochs
 
         num_classes = getattr(model, "num_classes", None)
         if num_classes is None:
@@ -177,8 +179,29 @@ class RareDiseaseModule(LightningModule):
         optimizer = torch.optim.AdamW(
             self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.max_epochs)
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+        
+        # Implement warmup + cosine annealing
+        if self.warmup_epochs > 0:
+            # Linear warmup followed by cosine annealing
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.01, end_factor=1.0, total_iters=self.warmup_epochs
+            )
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.max_epochs - self.warmup_epochs, eta_min=self.learning_rate * 0.01
+            )
+            # Chain warmup then cosine annealing
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[self.warmup_epochs],
+            )
+        else:
+            # No warmup, just cosine annealing
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.max_epochs, eta_min=self.learning_rate * 0.01
+            )
+        
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
     def _shared_step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         images = batch["image"]

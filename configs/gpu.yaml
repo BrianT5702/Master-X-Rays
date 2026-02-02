@@ -28,16 +28,16 @@ training:
   precision: "16-mixed"  # Mixed precision for faster training on GPU (saves VRAM)
   accumulate_grad_batches: 2  # Increased to maintain effective batch size = 48 (24 * 2)
   optimizer: adamw
-  learning_rate: 0.0001
-  weight_decay: 0.01
+  learning_rate: 0.00005  # Reduced from 0.0001 to prevent overfitting and improve stability
+  weight_decay: 0.02  # Increased from 0.01 for better regularization
   scheduler: cosine
-  warmup_epochs: 5
+  warmup_epochs: 3  # Reduced from 5 to reach full LR faster, then stabilize
   use_weighted_sampling: false  # ASL handles imbalance, sampling not needed
 
 model:
   backbone: densenet121
   pretrained: true
-  dropout: 0.2
+  dropout: 0.3  # Increased from 0.2 to reduce overfitting
   num_classes: 2
   # Class weights not needed with ASL (it handles imbalance internally)
 

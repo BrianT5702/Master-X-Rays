@@ -88,6 +88,7 @@ def main() -> None:
         model_cfg["backbone"],
         num_classes=model_cfg["num_classes"],
         pretrained=model_cfg["pretrained"],
+        dropout=model_cfg.get("dropout", 0.0),
     )
     
     # Get prediction threshold from config (default 0.3 for imbalanced rare disease detection)

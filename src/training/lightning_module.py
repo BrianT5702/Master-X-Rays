@@ -68,17 +68,27 @@ def asymmetric_loss(
     """
     probs = torch.sigmoid(logits)
     
-    # Positive samples: standard focal loss
-    pt_pos = probs * targets
-    pt_neg = (1 - probs) * (1 - targets)
+    # ASL for multilabel classification (Nodule, Fibrosis)
+    # For each class independently: handle positive and negative samples
+    # Positive samples: when target=1, we want high probability
+    # Negative samples: when target=0, we want low probability (with hard thresholding)
     
-    # Asymmetric focusing: different gamma for positive and negative
-    # Positive: (1 - pt)^gamma_pos
-    # Negative: (pt)^gamma_neg with hard thresholding
-    pt_neg = torch.clamp(pt_neg, max=1 - clip)
+    # For positive samples: pt = probability of positive class
+    # When target=1: pt_pos = probs; when target=0: pt_pos = 0 (masked out)
+    pt_pos = probs * targets
+    
+    # For negative samples: ASL hard thresholding
+    # According to ASL paper: for negatives, clamp p (probability of positive) to minimum of clip
+    # This means: if model predicts p < clip for a negative, treat it as p = clip (easy negative)
+    # If model predicts p >= clip, use actual p (hard negative - model is wrong, should be penalized)
+    # Formula: p_m = max(p, m) for negatives, where m = clip
+    probs_m = torch.clamp(probs, min=clip)  # Clamp p to minimum of clip for negatives
+    pt_neg = (1 - probs_m) * (1 - targets)  # pt_neg = 1 - p_m for negatives
     
     # Compute asymmetric loss components
+    # Positive loss: focal loss variant - focuses on hard positive examples
     loss_pos = -targets * torch.log(pt_pos + eps) * torch.pow(1 - pt_pos, gamma_pos)
+    # Negative loss: with hard thresholding to prevent easy negatives from suppressing rare positives
     loss_neg = -(1 - targets) * torch.log(1 - pt_neg + eps) * torch.pow(pt_neg, gamma_neg)
     
     loss = loss_pos + loss_neg

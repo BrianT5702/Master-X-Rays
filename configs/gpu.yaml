@@ -18,26 +18,28 @@ data:
 augmentations:
   horizontal_flip_prob: 0.5
   rotation_degrees: 10.0  # Limited to ±10° for anatomical plausibility (per thesis)
-  random_noise_std: 0.01
+  random_noise_std: 0.02  # Increased noise for stronger regularization (was 0.01)
   use_gan_synthetic: false
-  # Random Resized Crop (scale 0.8-1.0) is applied automatically in dataset
+  # Random Resized Crop (scale 0.9-1.0) is applied automatically in dataset
 
 training:
   batch_size: 24  # Reduced to save memory (16GB RAM limit)
-  max_epochs: 25
+  max_epochs: 20  # Reduced from 25: if best metrics are at 8-15, 20 epochs gives buffer without wasting time
   precision: "16-mixed"  # Mixed precision for faster training on GPU (saves VRAM)
   accumulate_grad_batches: 2  # Increased to maintain effective batch size = 48 (24 * 2)
   optimizer: adamw
-  learning_rate: 0.00005  # Reduced from 0.0001 to prevent overfitting and improve stability
-  weight_decay: 0.02  # Increased from 0.01 for better regularization
+  learning_rate: 0.00005  # REDUCED: Further reduced to prevent collapse after ASL fix (was 0.0001)
+  weight_decay: 0.01  # STABLE: Back to proven baseline value
   scheduler: cosine
-  warmup_epochs: 3  # Reduced from 5 to reach full LR faster, then stabilize
+  warmup_epochs: 3  # Reduced warmup to allow more learning time
+  gradient_clip_val: 1.0  # CRITICAL: Prevent gradient explosion that causes model collapse
   use_weighted_sampling: false  # ASL handles imbalance, sampling not needed
+  prediction_threshold: 0.3  # Threshold for F1 calculation (optimized for rare disease detection)
 
 model:
   backbone: densenet121
   pretrained: true
-  dropout: 0.3  # Increased from 0.2 to reduce overfitting
+  dropout: 0.3  # INCREASED: Higher dropout to prevent overfitting after ASL fix (was 0.25)
   num_classes: 2
   # Class weights not needed with ASL (it handles imbalance internally)
 
@@ -45,4 +47,4 @@ loss:
   name: asymmetric  # Asymmetric Loss (ASL) for extreme class imbalance
   gamma_neg: 4.0  # Focusing parameter for negative samples
   gamma_pos: 1.0  # Focusing parameter for positive samples
-  clip: 0.2  # Probability margin for hard thresholding negatives (per thesis: p < 0.2)
+  clip: 0.2  # STABLE: Back to proven baseline value

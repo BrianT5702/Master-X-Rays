@@ -19,7 +19,7 @@ def build_backbone(
                 torch.nn.Linear(in_features, num_classes)
             )
         else:
-        model.classifier = torch.nn.Linear(in_features, num_classes)
+            model.classifier = torch.nn.Linear(in_features, num_classes)
     elif name == "resnet50":
         model = tv_models.resnet50(weights="DEFAULT" if pretrained else None)
         in_features = model.fc.in_features

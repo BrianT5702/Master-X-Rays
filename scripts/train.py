@@ -171,16 +171,19 @@ def main() -> None:
         save_top_k=1,
         save_last=False,
     )
-    # Periodic checkpoint: save every 2 epochs to prevent data loss from crashes
+    # Periodic checkpoint: save every 5 epochs to prevent data loss from crashes (saves space)
     checkpoint_periodic = ModelCheckpoint(
-        filename="epoch-{epoch:02d}",
-        every_n_epochs=2,
+        monitor="val_auc",  # Monitor AUC to include in filename
+        filename="epoch-{epoch:02d}-{val_auc:.4f}",
+        every_n_epochs=5,  # Changed from 2 to 5 to save disk space
         save_top_k=-1,  # Keep all periodic checkpoints
         save_last=False,
     )
     
     # Explicitly disable early stopping - train for full max_epochs
     # No EarlyStopping callback is added, so training will run for all epochs
+    # Gradient clipping to prevent explosion and model collapse
+    gradient_clip_val = training_cfg.get("gradient_clip_val", None)
     trainer = pl.Trainer(
         max_epochs=training_cfg["max_epochs"],
         accelerator=accelerator,
@@ -188,6 +191,7 @@ def main() -> None:
         precision=precision,
         log_every_n_steps=10,
         accumulate_grad_batches=accumulate_grad_batches,
+        gradient_clip_val=gradient_clip_val,  # Prevent gradient explosion
         callbacks=[checkpoint_f1, checkpoint_auc, checkpoint_loss, checkpoint_periodic],
         enable_progress_bar=True,
     )

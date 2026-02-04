@@ -26,12 +26,12 @@ training:
   batch_size: 24  # Reduced to save memory (16GB RAM limit)
   max_epochs: 20  # Reduced from 25: if best metrics are at 8-15, 20 epochs gives buffer without wasting time
   precision: "16-mixed"  # Mixed precision for faster training on GPU (saves VRAM)
-  accumulate_grad_batches: 2  # Increased to maintain effective batch size = 48 (24 * 2)
+  accumulate_grad_batches: 4  # Recommended for 320x320 on 4GB VRAM
   optimizer: adamw
-  learning_rate: 0.00005  # REDUCED: Further reduced to prevent collapse after ASL fix (was 0.0001)
+  learning_rate: 0.0001  # Lower rate for fine-tuning textures in high-resolution medical images
   weight_decay: 0.01  # STABLE: Back to proven baseline value
   scheduler: cosine
-  warmup_epochs: 3  # Reduced warmup to allow more learning time
+  warmup_epochs: 5  # Gradually increase LR to stabilize DenseNet-121 backbone
   gradient_clip_val: 1.0  # CRITICAL: Prevent gradient explosion that causes model collapse
   use_weighted_sampling: false  # ASL handles imbalance, sampling not needed
   prediction_threshold: 0.3  # Threshold for F1 calculation (optimized for rare disease detection)
@@ -41,10 +41,10 @@ model:
   pretrained: true
   dropout: 0.3  # INCREASED: Higher dropout to prevent overfitting after ASL fix (was 0.25)
   num_classes: 2
-  # Class weights not needed with ASL (it handles imbalance internally)
+  class_weights: [1.0, 3.0]  # Boost for Fibrosis (prevalence <1.5%) to exit trivial solution trap
 
 loss:
   name: asymmetric  # Asymmetric Loss (ASL) for extreme class imbalance
   gamma_neg: 4.0  # Focusing parameter for negative samples
   gamma_pos: 1.0  # Focusing parameter for positive samples
-  clip: 0.2  # STABLE: Back to proven baseline value
+  clip: 0.05  # Reduced from 0.2 to allow signal from easy negatives early on

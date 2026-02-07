@@ -38,11 +38,11 @@ model:
   pretrained: true
   dropout: 0.2
   num_classes: 2
-  class_weights: [1.0, 3.0]  # Boost for Fibrosis (prevalence <1.5%) to exit trivial solution trap
+  class_weights: [1.0, 5.0]  # High-weight penalty for Fibrosis (prevalence <1.5%) - 5x impact for rare class
 
 loss:
   name: asymmetric  # Asymmetric Loss (ASL) for extreme class imbalance
   gamma_neg: 4.0  # Focusing parameter for negative samples
-  gamma_pos: 1.0  # Focusing parameter for positive samples
+  gamma_pos: 2.0  # Increased to prevent gradient vanishing for positive samples, forcing refinement of subtle textures
   clip: 0.05  # Reduced from 0.2 to allow signal from easy negatives early on
 

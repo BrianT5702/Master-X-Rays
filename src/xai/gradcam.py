@@ -36,7 +36,7 @@ class GradCAM:
             # Inplace operations in DenseNet are handled by using train mode
             self.activations = output
         else:
-        self.activations = output
+            self.activations = output
 
     def _save_gradient(self, module, grad_input, grad_output) -> None:
         """Save gradients from backward pass."""
@@ -75,7 +75,7 @@ class GradCAM:
         # Activations will be saved by forward hook
         # Gradients will be saved by backward hook during backward pass
         with torch.enable_grad():
-        output = self.model(input_tensor)
+            output = self.model(input_tensor)
 
         # Restore model mode
         self.model.train(was_training)

@@ -93,6 +93,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, config: dict) -> torch.nn.
         model_cfg["backbone"],
         num_classes=model_cfg["num_classes"],
         pretrained=model_cfg["pretrained"],
+        dropout=model_cfg.get("dropout", 0.0),  # Must match training config
     )
     
     # Create Lightning module with same config as training

@@ -20,7 +20,11 @@ augmentations:
   rotation_degrees: 10.0  # Limited to ±10° for anatomical plausibility (per thesis)
   random_noise_std: 0.02  # Increased noise for stronger regularization (was 0.01)
   use_gan_synthetic: false
-  # Random Resized Crop (scale 0.9-1.0) is applied automatically in dataset
+  # Random Resized Crop with curriculum learning (more aggressive scale)
+  resized_crop_scale: [0.7, 1.0]  # More aggressive augmentation for fine-grained learning
+  # Brightness/Contrast jitter for texture recognition
+  brightness_jitter: 0.1  # Small brightness variation
+  contrast_jitter: 0.1  # Small contrast variation
 
 training:
   batch_size: 24  # Reduced to save memory (16GB RAM limit)
@@ -28,13 +32,13 @@ training:
   precision: "16-mixed"  # Mixed precision for faster training on GPU (saves VRAM)
   accumulate_grad_batches: 4  # Recommended for 320x320 on 4GB VRAM
   optimizer: adamw
-  learning_rate: 0.0001  # Lower rate for fine-tuning textures in high-resolution medical images
+  learning_rate: 0.00001  # Cool down: smaller LR for precise fine-tuning of pathological textures
   weight_decay: 0.01  # STABLE: Back to proven baseline value
   scheduler: cosine
   warmup_epochs: 5  # Gradually increase LR to stabilize DenseNet-121 backbone
   gradient_clip_val: 1.0  # CRITICAL: Prevent gradient explosion that causes model collapse
   use_weighted_sampling: false  # ASL handles imbalance, sampling not needed
-  prediction_threshold: 0.3  # Threshold for F1 calculation (optimized for rare disease detection)
+  prediction_threshold: 0.15  # Lower threshold for sensitivity (Recall) on rare life-threatening conditions
 
 model:
   backbone: densenet121
@@ -46,5 +50,5 @@ model:
 loss:
   name: asymmetric  # Asymmetric Loss (ASL) for extreme class imbalance
   gamma_neg: 4.0  # Focusing parameter for negative samples
-  gamma_pos: 1.0  # Focusing parameter for positive samples
-  clip: 0.05  # Reduced from 0.2 to allow signal from easy negatives early on
+  gamma_pos: 2.0  # Increased from 1.0 to force focus on rare positive samples
+  clip: 0.02  # Further reduced from 0.05 for more persistent gradient signal on rare classes

@@ -41,10 +41,10 @@ model:
   pretrained: true
   dropout: 0.3  # INCREASED: Higher dropout to prevent overfitting after ASL fix (was 0.25)
   num_classes: 2
-  class_weights: [1.0, 5.0]  # High-weight penalty for Fibrosis (prevalence <1.5%) - 5x impact for rare class
+  class_weights: [1.0, 6.0]  # Strong emphasis on Fibrosis (<1.5% prevalence) - safe with clip=0.02 and gamma_pos=1.0
 
 loss:
   name: asymmetric  # Asymmetric Loss (ASL) for extreme class imbalance
   gamma_neg: 4.0  # Focusing parameter for negative samples
-  gamma_pos: 2.0  # Hybrid Pressure: Increased to force focus on rare positive features
-  clip: 0.05  # Hybrid Pressure: v89 stable value - allows signal from easy negatives early on
+  gamma_pos: 1.0  # Gradient Recovery: Reduced from 2.0 to allow confidence scores to grow naturally
+  clip: 0.02  # Gradient Recovery: Reduced from 0.05 to increase gradient signal and "thaw" frozen gradients

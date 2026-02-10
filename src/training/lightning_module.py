@@ -44,6 +44,7 @@ def asymmetric_loss(
     clip: float = 0.2,
     eps: float = 1e-8,
     reduction: str = "mean",
+    class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Asymmetric Loss (ASL) for multi-label classification with extreme class imbalance.
@@ -92,6 +93,13 @@ def asymmetric_loss(
     loss_neg = -(1 - targets) * torch.log(1 - pt_neg + eps) * torch.pow(pt_neg, gamma_neg)
     
     loss = loss_pos + loss_neg
+    
+    # Apply class weights if provided (critical for rare class prioritization)
+    if class_weights is not None:
+        class_weights = class_weights.to(loss.device)
+        # Expand weights to match batch and class dimensions: [num_classes] -> [batch, num_classes]
+        weight_tensor = class_weights.unsqueeze(0).expand_as(loss)
+        loss = loss * weight_tensor
     
     if reduction == "mean":
         return loss.mean()
@@ -227,7 +235,8 @@ class RareDiseaseModule(LightningModule):
             gamma_pos = self.loss_config.get("gamma_pos", 1.0)
             clip = self.loss_config.get("clip", 0.2)
             loss = asymmetric_loss(
-                logits, labels, gamma_neg=gamma_neg, gamma_pos=gamma_pos, clip=clip, reduction="mean"
+                logits, labels, gamma_neg=gamma_neg, gamma_pos=gamma_pos, clip=clip, reduction="mean",
+                class_weights=self.class_weights  # Apply class weights to ASL (critical fix)
             )
         elif loss_name == "focal":
             alpha = self.loss_config.get("alpha", 0.75)

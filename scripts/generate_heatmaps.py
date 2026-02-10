@@ -7,6 +7,7 @@ samples to visualize which regions the model focuses on for predictions.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -178,9 +179,21 @@ def main() -> None:
     # Get backbone name
     backbone_name = model_cfg["backbone"]
     
-    # Create output directory
-    output_dir = args.output_dir / args.split / args.method
+    # Extract version number from checkpoint path (e.g., "version_89" -> "89")
+    version_match = re.search(r"version_(\d+)", str(args.checkpoint))
+    if version_match:
+        version_num = version_match.group(1)
+    else:
+        # Fallback: try to extract from parent directory
+        checkpoint_str = str(args.checkpoint)
+        version_match = re.search(r"version[_-]?(\d+)", checkpoint_str, re.IGNORECASE)
+        version_num = version_match.group(1) if version_match else "unknown"
+    
+    # Create output directory organized by version number
+    # Structure: heatmaps/test/gradcam/version_XX/
+    output_dir = args.output_dir / args.split / args.method / f"version_{version_num}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"📁 Saving heatmaps to version-specific folder: version_{version_num}")
     
     # Determine which classes to visualize
     if args.class_idx is not None:

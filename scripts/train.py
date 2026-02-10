@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("configs/base.yaml"), help="Path to YAML config.")
     parser.add_argument("--accelerator", type=str, default="auto", help="PyTorch Lightning accelerator.")
     parser.add_argument("--devices", type=int, default=1, help="Number of devices to use.")
-    # No checkpoint argument: always start a fresh run
+    parser.add_argument("--resume", type=Path, default=None, help="Path to checkpoint to resume training from (e.g., last.ckpt).")
     return parser.parse_args()
 
 
@@ -95,20 +95,50 @@ def main() -> None:
     prediction_threshold = training_cfg.get("prediction_threshold", 0.3)
     class_weights = model_cfg.get("class_weights", None)  # Optional: ASL handles imbalance internally
     
-    # Always start a fresh LightningModule for a new training run
-    print("🆕 Starting new training run (no checkpoint resumption)")
-    warmup_epochs = training_cfg.get("warmup_epochs", 0)
-    lightning_module = RareDiseaseModule(
-        model=backbone,
-        learning_rate=training_cfg["learning_rate"],
-        weight_decay=training_cfg["weight_decay"],
-        class_weights=class_weights,
-        loss_config=loss_cfg,
-        max_epochs=training_cfg["max_epochs"],
-        prediction_threshold=prediction_threshold,
-        samples_per_class=None,
-        warmup_epochs=warmup_epochs,
-    )
+    # Check if resuming from checkpoint
+    ckpt_path = None
+    if args.resume:
+        ckpt_path = Path(args.resume)
+        if not ckpt_path.is_absolute():
+            ckpt_path = PROJECT_ROOT / ckpt_path
+        if not ckpt_path.exists():
+            print(f"❌ Error: Checkpoint not found at {ckpt_path}")
+            print("   Starting fresh training run instead.")
+            ckpt_path = None
+        else:
+            print(f"🔄 Resuming training from checkpoint: {ckpt_path}")
+    
+    if ckpt_path is None:
+        print("🆕 Starting new training run (no checkpoint resumption)")
+        warmup_epochs = training_cfg.get("warmup_epochs", 0)
+        lightning_module = RareDiseaseModule(
+            model=backbone,
+            learning_rate=training_cfg["learning_rate"],
+            weight_decay=training_cfg["weight_decay"],
+            class_weights=class_weights,
+            loss_config=loss_cfg,
+            max_epochs=training_cfg["max_epochs"],
+            prediction_threshold=prediction_threshold,
+            samples_per_class=None,
+            warmup_epochs=warmup_epochs,
+        )
+    else:
+        # Load from checkpoint - Lightning will restore model, optimizer, and epoch
+        print(f"📂 Loading model from checkpoint...")
+        warmup_epochs = training_cfg.get("warmup_epochs", 0)
+        lightning_module = RareDiseaseModule.load_from_checkpoint(
+            str(ckpt_path),
+            model=backbone,
+            learning_rate=training_cfg["learning_rate"],
+            weight_decay=training_cfg["weight_decay"],
+            class_weights=class_weights,
+            loss_config=loss_cfg,
+            max_epochs=training_cfg["max_epochs"],
+            prediction_threshold=prediction_threshold,
+            samples_per_class=None,
+            warmup_epochs=warmup_epochs,
+        )
+        print(f"✅ Checkpoint loaded successfully!")
 
     # Auto-detect GPU, fall back to CPU if not available
     # Check CUDA availability
@@ -200,6 +230,7 @@ def main() -> None:
         lightning_module,
         train_dataloaders=dataloaders["train"],
         val_dataloaders=dataloaders["val"],
+        ckpt_path=str(ckpt_path) if ckpt_path else None,  # Resume from checkpoint if provided
     )
     trainer.test(lightning_module, dataloaders["test"])
     

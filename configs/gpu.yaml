@@ -28,7 +28,7 @@ training:
   precision: "16-mixed"  # Mixed precision for faster training on GPU (saves VRAM)
   accumulate_grad_batches: 4  # Recommended for 320x320 on 4GB VRAM
   optimizer: adamw
-  learning_rate: 0.0001  # Hybrid Pressure: Return to v89 stable rate (1e-4) for better gradient path
+  learning_rate: 0.0001  # Stable learning rate (1e-4) proven to work for 320x320
   weight_decay: 0.01  # STABLE: Back to proven baseline value
   scheduler: cosine
   warmup_epochs: 5  # Gradually increase LR to stabilize DenseNet-121 backbone
@@ -41,10 +41,10 @@ model:
   pretrained: true
   dropout: 0.3  # INCREASED: Higher dropout to prevent overfitting after ASL fix (was 0.25)
   num_classes: 2
-  class_weights: [1.0, 6.0]  # Strong emphasis on Fibrosis (<1.5% prevalence) - safe with clip=0.02 and gamma_pos=1.0
+  class_weights: [1.0, 4.0]  # Balanced emphasis on Fibrosis (2–4x range from Gemini) to avoid over-correction
 
 loss:
   name: asymmetric  # Asymmetric Loss (ASL) for extreme class imbalance
-  gamma_neg: 4.0  # Focusing parameter for negative samples
-  gamma_pos: 1.0  # Gradient Recovery: Reduced from 2.0 to allow confidence scores to grow naturally
-  clip: 0.02  # Gradient Recovery: Reduced from 0.05 to increase gradient signal and "thaw" frozen gradients
+  gamma_neg: 3.0  # Reduced from 4.0 (Gemini: 2–3) to lessen gradient starvation from easy negatives
+  gamma_pos: 1.0  # Keep at 1.0 to let rare positive confidences grow
+  clip: 0.02  # In recommended 0.01–0.02 range; keeps small signal from most images

@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--accelerator", type=str, default="auto", help="PyTorch Lightning accelerator.")
     parser.add_argument("--devices", type=int, default=1, help="Number of devices to use.")
     parser.add_argument("--resume", type=Path, default=None, help="Path to checkpoint to resume training from (e.g., last.ckpt).")
+    parser.add_argument("--test-only", action="store_true", help="Only run test on the given checkpoint (requires --resume with checkpoint path).")
     return parser.parse_args()
 
 
@@ -82,6 +83,54 @@ def main() -> None:
         use_roi_extraction=use_roi_extraction,
         cache_dir=cache_dir,
     )
+
+    # --- Test-only mode: load checkpoint and run test, then exit ---
+    if args.test_only:
+        if not args.resume:
+            print("❌ Error: --resume <checkpoint_path> is required when using --test-only.")
+            sys.exit(1)
+        test_ckpt = Path(args.resume)
+        if not test_ckpt.is_absolute():
+            test_ckpt = PROJECT_ROOT / test_ckpt
+        if not test_ckpt.exists():
+            print(f"❌ Error: Checkpoint not found at {test_ckpt}")
+            sys.exit(1)
+        print(f"📂 Loading checkpoint for testing: {test_ckpt}")
+        backbone = build_backbone(
+            model_cfg["backbone"],
+            num_classes=model_cfg["num_classes"],
+            pretrained=model_cfg["pretrained"],
+            dropout=model_cfg.get("dropout", 0.0),
+        )
+        prediction_threshold = training_cfg.get("prediction_threshold", 0.3)
+        class_weights = model_cfg.get("class_weights", None)
+        warmup_epochs = training_cfg.get("warmup_epochs", 0)
+        lightning_module = RareDiseaseModule.load_from_checkpoint(
+            str(test_ckpt),
+            model=backbone,
+            learning_rate=training_cfg["learning_rate"],
+            weight_decay=training_cfg["weight_decay"],
+            class_weights=class_weights,
+            loss_config=loss_cfg,
+            max_epochs=training_cfg["max_epochs"],
+            prediction_threshold=prediction_threshold,
+            samples_per_class=None,
+            warmup_epochs=warmup_epochs,
+        )
+        cuda_available = torch.cuda.is_available()
+        accelerator = "gpu" if cuda_available else "cpu"
+        precision = training_cfg["precision"] if accelerator == "gpu" else 32
+        trainer = pl.Trainer(
+            accelerator=accelerator,
+            devices=args.devices,
+            precision=precision,
+            enable_progress_bar=True,
+        )
+        print("\n" + "="*60)
+        print("Running TEST evaluation...")
+        print("="*60)
+        trainer.test(lightning_module, dataloaders["test"])
+        return
 
     # Build model architecture
     backbone = build_backbone(

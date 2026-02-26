@@ -238,6 +238,11 @@ class RareDiseaseModule(LightningModule):
                 logits, labels, gamma_neg=gamma_neg, gamma_pos=gamma_pos, clip=clip, reduction="mean",
                 class_weights=self.class_weights  # Apply class weights to ASL (critical fix)
             )
+            # Auxiliary BCE keeps gradient signal when ASL collapses (prevents loss → 0, improves AUC/F1)
+            bce_aux_weight = self.loss_config.get("bce_aux_weight", 0.0)
+            if bce_aux_weight > 0:
+                bce_aux = F.binary_cross_entropy_with_logits(logits, labels, reduction="mean")
+                loss = loss + bce_aux_weight * bce_aux
         elif loss_name == "focal":
             alpha = self.loss_config.get("alpha", 0.75)
             gamma = self.loss_config.get("gamma", 2.0)
@@ -280,12 +285,14 @@ class RareDiseaseModule(LightningModule):
         if metrics["acc"] is not None:
             metrics["acc"](preds, labels.int())
 
+        # Log only epoch-level metrics to avoid thousands of per-step rows in metrics.csv
+        # (one aggregated value per epoch for each metric)
         self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"{stage}_f1", metrics["f1"], prog_bar=True, on_epoch=True)
+        self.log(f"{stage}_f1", metrics["f1"], prog_bar=True, on_step=False, on_epoch=True)
         if metrics["auc"] is not None:
-            self.log(f"{stage}_auc", metrics["auc"], prog_bar=True, on_epoch=True)
+            self.log(f"{stage}_auc", metrics["auc"], prog_bar=True, on_step=False, on_epoch=True)
         if metrics["acc"] is not None:
-            self.log(f"{stage}_acc", metrics["acc"], prog_bar=False, on_epoch=True)
+            self.log(f"{stage}_acc", metrics["acc"], prog_bar=False, on_step=False, on_epoch=True)
 
         return loss
 

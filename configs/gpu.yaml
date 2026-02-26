@@ -24,11 +24,12 @@ augmentations:
 
 training:
   batch_size: 24  # Reduced to save memory (16GB RAM limit)
-  max_epochs: 20  # Reduced from 25: if best metrics are at 8-15, 20 epochs gives buffer without wasting time
+  max_epochs: 40  # Upper limit; early stopping will typically stop at best AUC
+  early_stopping_patience: 6  # Stop when val_auc does not improve for 6 epochs (avoids collapse)
   precision: "16-mixed"  # Mixed precision for faster training on GPU (saves VRAM)
   accumulate_grad_batches: 4  # Recommended for 320x320 on 4GB VRAM
   optimizer: adamw
-  learning_rate: 0.0001  # Stable learning rate (1e-4) proven to work for 320x320
+  learning_rate: 0.00005  # 5e-5 for fine-tuning; reduces metric wobbles in later epochs
   weight_decay: 0.01  # STABLE: Back to proven baseline value
   scheduler: cosine
   warmup_epochs: 5  # Gradually increase LR to stabilize DenseNet-121 backbone
@@ -45,6 +46,7 @@ model:
 
 loss:
   name: asymmetric  # Asymmetric Loss (ASL) for extreme class imbalance
-  gamma_neg: 3.0  # Reduced from 4.0 (Gemini: 2–3) to lessen gradient starvation from easy negatives
+  gamma_neg: 2.0  # Reduced to "thaw" gradients; keeps loss from collapsing so model keeps learning
   gamma_pos: 1.0  # Keep at 1.0 to let rare positive confidences grow
-  clip: 0.02  # In recommended 0.01–0.02 range; keeps small signal from most images
+  clip: 0.01  # Lower clip allows more gradient signal for rare diseases to cross threshold
+  bce_aux_weight: 0.1  # Auxiliary BCE keeps gradients alive when ASL collapses; improves AUC/F1

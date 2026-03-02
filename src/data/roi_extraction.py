@@ -1,10 +1,11 @@
 """
-Final Robust ROI Extraction for NIH ChestX-ray14.
+ROI Extraction and lung-field masking for NIH ChestX-ray14.
 
-Strategy: For NIH dataset, use intelligent center crop as primary method.
-- NIH images are already well-centered frontal chest X-rays
-- Center crop (removing ~10-15% margin) removes artifacts and focuses on lungs
-- ROI detection is used as validation/refinement, not primary method
+Strategy (aligned with literature, e.g. Aslani et al. arXiv:2208.10320):
+- Crop to chest-centered region (center crop or contour-based).
+- Apply a body/lung-field mask so pixels outside the anatomical region are set to 0.
+  This prevents shortcut learning on borders, corners, and text (model is forced to
+  use lung-area features). Used in UCL pipeline and CheXmask-style preprocessing.
 """
 
 from __future__ import annotations
@@ -16,14 +17,65 @@ from PIL import Image, ImageOps
 # Optimize OpenCV
 cv2.setNumThreads(1)
 
-def extract_lung_roi(image: Image.Image) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
+
+def _apply_body_mask(image: Image.Image) -> Image.Image:
+    """
+    Zero out non-anatomical regions (padding, corners, thin borders) so the model cannot use them.
+    Does NOT zero lung tissue: only small border-touching dark components are removed (artifacts/padding).
+
+    Method: Otsu → dark pixels; find connected components; zero only components that (1) touch the
+    border AND (2) are small (below fraction of image). Large border-touching dark (e.g. lung edge)
+    is kept so the lung does not look artificially cut.
+    """
+    original_mode = image.mode
+    arr = np.array(image.convert("L"))
+    h, w = arr.shape
+    total_pixels = h * w
+
+    # Otsu: dark pixels (background, padding, and some lung)
+    _, binary_dark = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary_dark, connectivity=8
+    )
+
+    # Only zero out border-touching dark components that are SMALL (padding/artifacts, not lung)
+    # Lung or large anatomy touching the border is kept (max_remove_ratio of image area)
+    max_remove_ratio = 0.15  # Remove at most 15% of image; larger = likely lung, keep it
+    mask = np.ones((h, w), dtype=np.uint8)
+
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area > total_pixels * max_remove_ratio:
+            continue  # Large component: do not zero (likely lung/body)
+        ys, xs = np.where(labels == i)
+        touches_border = (
+            np.any(xs == 0) or np.any(xs == w - 1) or
+            np.any(ys == 0) or np.any(ys == h - 1)
+        )
+        if touches_border:
+            mask[labels == i] = 0
+
+    # Apply mask: zero only small border-touching regions in all channels
+    if image.mode == "RGB":
+        out = np.array(image)
+        out[mask == 0, :] = 0
+        return Image.fromarray(out)
+    out = arr.copy()
+    out[mask == 0] = 0
+    return Image.fromarray(out, mode="L").convert(original_mode)
+
+def extract_lung_roi(
+    image: Image.Image,
+    apply_mask: bool = True,
+) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     """
     ROI extraction optimized for NIH Chest X-ray 14 dataset.
-    
-    Strategy:
-    1. Try to detect lung regions using adaptive thresholding
-    2. If detection fails or is unreliable, use intelligent center crop
-    3. Center crop removes edge artifacts while preserving lung region
+
+    Strategy (aligned with literature to reduce shortcut learning):
+    1. Crop to chest-centered region (contour-based or center crop).
+    2. If apply_mask is True, zero out border-touching dark regions so the model
+       cannot use corners/borders/text; forces focus on lung-area features.
     """
     original_mode = image.mode
     img_w, img_h = image.size
@@ -154,7 +206,8 @@ def extract_lung_roi(image: Image.Image) -> Tuple[Image.Image, Tuple[int, int, i
                 
                 if cropped.mode != original_mode:
                     cropped = cropped.convert(original_mode)
-                
+                if apply_mask:
+                    cropped = _apply_body_mask(cropped)
                 return cropped, (new_x, new_y, square_size, square_size)
     
     except Exception:
@@ -186,5 +239,6 @@ def extract_lung_roi(image: Image.Image) -> Tuple[Image.Image, Tuple[int, int, i
     
     if cropped.mode != original_mode:
         cropped = cropped.convert(original_mode)
-    
+    if apply_mask:
+        cropped = _apply_body_mask(cropped)
     return cropped, default_bbox

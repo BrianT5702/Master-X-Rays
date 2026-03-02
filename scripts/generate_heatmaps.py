@@ -54,7 +54,12 @@ def parse_args() -> argparse.Namespace:
         "--num_samples",
         type=int,
         default=20,
-        help="Number of samples to generate heatmaps for.",
+        help="Number of samples (X-rays) to generate heatmaps for. Ignored if --all_positives is set.",
+    )
+    parser.add_argument(
+        "--all_positives",
+        action="store_true",
+        help="Generate heatmaps for every test/val image that has at least one positive (Nodule or Fibrosis). Ignores --num_samples.",
     )
     parser.add_argument(
         "--output_dir",
@@ -141,6 +146,7 @@ def main() -> None:
     # Create dataloader for the specified split
     augmentation_config = config.get("augmentations", {})
     use_roi_extraction = data_cfg.get("use_roi_extraction", True)
+    apply_roi_mask = data_cfg.get("apply_roi_mask", True)
     cache_dir = data_cfg.get("cache_dir", None)
     if cache_dir:
         cache_dir = Path(cache_dir)
@@ -162,6 +168,7 @@ def main() -> None:
         use_weighted_sampling=False,
         patient_split=data_cfg.get("patient_split", True),
         use_roi_extraction=use_roi_extraction,
+        apply_roi_mask=apply_roi_mask,
         cache_dir=cache_dir,
     )
     
@@ -201,14 +208,18 @@ def main() -> None:
     else:
         class_indices = list(range(len(class_names)))
     
-    print(f"Generating heatmaps for {args.num_samples} samples...")
+    if args.all_positives:
+        print("Generating heatmaps for ALL images with at least one positive (Nodule or Fibrosis)...")
+    else:
+        print(f"Generating heatmaps for up to {args.num_samples} samples...")
     print(f"Classes: {[class_names[i] for i in class_indices]}")
     print(f"Output directory: {output_dir}")
     
     # Generate heatmaps
     samples_processed = 0
+    positives_processed = 0
     for batch_idx, batch in enumerate(dataloader):
-        if samples_processed >= args.num_samples:
+        if not args.all_positives and samples_processed >= args.num_samples:
             break
         
         # Handle dictionary batch format
@@ -217,6 +228,14 @@ def main() -> None:
             labels = batch["labels"]
         else:
             images, labels = batch
+        
+        # When --all_positives: only process images that have at least one positive label
+        if args.all_positives:
+            has_nodule = labels[0, 0].item() >= 0.5
+            has_fibrosis = labels[0, 1].item() >= 0.5
+            if not (has_nodule or has_fibrosis):
+                continue
+            positives_processed += 1
         
         images = images.to(device)
         
@@ -244,9 +263,10 @@ def main() -> None:
             pred_prob = probs[0, class_idx].item()
             gt_label = labels[0, class_idx].item()
             
-            # Create filename
+            # Create filename (use positives_processed when all_positives so names are contiguous)
+            idx_label = positives_processed if args.all_positives else batch_idx
             filename = (
-                f"sample_{batch_idx:04d}_class_{class_name}_"
+                f"sample_{idx_label:04d}_class_{class_name}_"
                 f"pred_{pred_prob:.3f}_gt_{int(gt_label)}.png"
             )
             save_path = output_dir / filename
@@ -261,10 +281,12 @@ def main() -> None:
             
             samples_processed += 1
             
-            if (batch_idx + 1) % 10 == 0:
-                print(f"Processed {batch_idx + 1} samples...")
+        n_so_far = positives_processed if args.all_positives else (samples_processed // len(class_indices))
+        if n_so_far > 0 and n_so_far % 20 == 0:
+            print(f"Processed {n_so_far} images...")
     
-    print(f"\n✅ Generated {samples_processed} heatmap visualizations!")
+    total_images = positives_processed if args.all_positives else (samples_processed // max(1, len(class_indices)))
+    print(f"\n✅ Generated {samples_processed} heatmap visualizations ({total_images} X-rays)!")
     print(f"   Saved to: {output_dir}")
 
 

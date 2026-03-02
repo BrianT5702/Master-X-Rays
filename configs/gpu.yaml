@@ -14,6 +14,7 @@ data:
   test_split: 0.1
   patient_split: true  # Patient-level splitting to prevent data leakage
   use_roi_extraction: true  # Will be disabled automatically if cache_dir is set
+  apply_roi_mask: true  # Zero out border-touching background so model focuses on lung area (reduces shortcut learning)
 
 augmentations:
   horizontal_flip_prob: 0.5
@@ -21,6 +22,7 @@ augmentations:
   random_noise_std: 0.02  # Increased noise for stronger regularization (was 0.01)
   use_gan_synthetic: false
   # Random Resized Crop (scale 0.9-1.0) is applied automatically in dataset
+  # Note: Normalization maps pixels to [-1,1] so previews look darker; contrast is preserved, features are not wiped.
 
 training:
   batch_size: 24  # Reduced to save memory (16GB RAM limit)

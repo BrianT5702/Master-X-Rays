@@ -24,15 +24,17 @@ def visualize_roi_extraction(
     images_root: Path,
     num_samples: int = 12,
     save_dir: Path = Path("roi_visualizations"),
+    apply_mask: bool = True,
 ) -> None:
     """
     Visualize ROI extraction on random samples from the dataset.
-    
+
     Args:
         csv_path: Path to NIH metadata CSV
         images_root: Root directory containing images
         num_samples: Number of random samples to visualize
         save_dir: Directory to save visualization images
+        apply_mask: If True, apply body mask to zero border (new ROI); if False, crop only.
     """
     # Load metadata
     print(f"[INFO] Loading metadata from {csv_path}...")
@@ -72,8 +74,8 @@ def visualize_roi_extraction(
             image_path = _find_image_path(images_root, image_index)
             original = Image.open(image_path).convert("RGB")
             
-            # Extract ROI
-            cropped, bbox = extract_lung_roi(original.copy())
+            # Extract ROI (with optional body mask to reduce shortcut learning)
+            cropped, bbox = extract_lung_roi(original.copy(), apply_mask=apply_mask)
             
             # Check if fallback was used (bbox covers most of image)
             crop_ratio = (bbox[2] * bbox[3]) / (original.size[0] * original.size[1])
@@ -151,8 +153,7 @@ def visualize_roi_extraction(
         try:
             image_path = _find_image_path(images_root, image_index)
             original = Image.open(image_path).convert("RGB")
-            cropped, bbox = extract_lung_roi(original.copy())
-            
+            cropped, bbox = extract_lung_roi(original.copy(), apply_mask=apply_mask)
             # Save side-by-side comparison
             w, h = original.size
             combined = Image.new("RGB", (w * 2, h))
@@ -208,16 +209,17 @@ def main() -> None:
                        default=Path("datasets/NIH Chest X-Rays Master Datasets/archive"),
                        help="Root directory containing images")
     parser.add_argument("--num-samples", type=int, default=12, help="Number of samples to visualize")
-    parser.add_argument("--save-dir", type=Path, default=Path("roi_visualizations"), 
+    parser.add_argument("--save-dir", type=Path, default=Path("roi_visualizations"),
                        help="Directory to save visualizations")
-    
+    parser.add_argument("--no-mask", action="store_true", help="Disable body mask (only crop, no border zeroing)")
     args = parser.parse_args()
-    
+
     visualize_roi_extraction(
         csv_path=args.csv,
         images_root=args.images_root,
         num_samples=args.num_samples,
         save_dir=args.save_dir,
+        apply_mask=not args.no_mask,
     )
 
 

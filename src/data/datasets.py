@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
@@ -27,6 +27,45 @@ class AddGaussianNoise:
         return torch.clamp(tensor + torch.randn_like(tensor) * self.std, 0, 1)
 
 
+class RandomLowerArtifactErase:
+    """
+    Randomly erase a rectangular region near the lower corners of the image.
+    
+    Motivation:
+    - Grad-CAM shows the current model relies heavily on a small artifact region
+      near the diaphragm / lower-right corner.
+    - This transform makes that shortcut unreliable during training so the model
+      is forced to learn lung texture instead of border artifacts.
+    """
+
+    def __init__(self, p: float = 0.5, height_ratio: float = 0.20, width_ratio: float = 0.25) -> None:
+        self.p = p
+        self.height_ratio = height_ratio
+        self.width_ratio = width_ratio
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+
+        w, h = img.size
+
+        # Randomly choose left or right lower corner to erase
+        erase_right = random.random() < 0.5
+
+        bw = int(w * self.width_ratio)
+        bh = int(h * self.height_ratio)
+        x1 = w - bw if erase_right else 0
+        y1 = h - bh
+        x2 = x1 + bw
+        y2 = h
+
+        # Draw a dark rectangle (near background) to disrupt shortcut cues
+        img = img.copy()
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([x1, y1, x2, y2], fill=0)
+        return img
+
+
 class NIHChestXRayDataset(Dataset):
     """Dataset for NIH ChestX-ray14 with preprocessing and augmentation."""
 
@@ -39,6 +78,7 @@ class NIHChestXRayDataset(Dataset):
         augment: bool = False,
         augmentation_config: Optional[Dict] = None,
         use_roi_extraction: bool = True,
+        apply_roi_mask: bool = True,
         cache_dir: Optional[Path] = None,
     ) -> None:
         """
@@ -50,6 +90,7 @@ class NIHChestXRayDataset(Dataset):
             augment: Whether to apply data augmentation
             augmentation_config: Dict with augmentation parameters
             use_roi_extraction: Whether to extract lung ROI to remove artifacts
+        apply_roi_mask: If True, zero out border-touching background (reduces shortcut learning on corners/borders).
         """
         self.metadata = metadata.reset_index(drop=True)
         self.images_root = Path(images_root)
@@ -58,6 +99,7 @@ class NIHChestXRayDataset(Dataset):
         self.augment = augment
         self.augmentation_config = augmentation_config or {}
         self.use_roi_extraction = use_roi_extraction
+        self.apply_roi_mask = apply_roi_mask
         self.cache_dir = Path(cache_dir) if cache_dir else None
 
         # Create binary labels
@@ -73,7 +115,7 @@ class NIHChestXRayDataset(Dataset):
         # Using simple centering normalization: (pixel/255 - 0.5) / 0.5 maps to [-1, 1]
         # This preserves natural X-ray appearance without aggressive contrast changes
         self.mean = [0.5, 0.5, 0.5]  # Center at 0.5 (mid-gray for X-rays)
-        self.std = [0.5, 0.5, 0.5]   # Scale to [-1, 1] range
+        self.std = [0.5, 0.5, 0.5]   # Scale to [-1, 1] range (display will look darker; features are preserved)
 
         # Build transform pipeline
         self.transform = self._build_transform()
@@ -92,9 +134,9 @@ class NIHChestXRayDataset(Dataset):
             transform_list.append(
                 transforms.RandomResizedCrop(
                     size=self.image_size,
-                    scale=(0.9, 1.0),  # Reduced from 0.8-1.0 to 0.9-1.0 to minimize edge cropping
-                    ratio=(0.95, 1.05),  # Tighter ratio to keep focus on center (was 0.9-1.1)
-                    interpolation=transforms.InterpolationMode.BILINEAR,  # Faster than BICUBIC
+                    scale=(0.9, 1.0),  # Keep close to full field-of-view
+                    ratio=(0.95, 1.05),
+                    interpolation=transforms.InterpolationMode.BILINEAR,
                 )
             )
             
@@ -114,6 +156,9 @@ class NIHChestXRayDataset(Dataset):
                 transform_list.append(
                     transforms.RandomRotation(degrees=(-rotation_degrees, rotation_degrees))
                 )
+
+            # Targeted artifact suppression: randomly erase lower corners to break shortcut learning
+            transform_list.append(RandomLowerArtifactErase(p=0.5))
         else:
             # For validation/test: just resize to target size
             # Using BILINEAR for faster processing
@@ -205,7 +250,7 @@ class NIHChestXRayDataset(Dataset):
                 image_path = self._find_image_path(image_index)
                 image = self._load_image(image_path)
                 if self.use_roi_extraction:
-                    image, _ = extract_lung_roi(image)
+                    image, _ = extract_lung_roi(image, apply_mask=self.apply_roi_mask)
                 # Resize if not already cached at correct size
                 if image.size != self.image_size:
                     image = image.resize(self.image_size, Image.Resampling.BILINEAR)
@@ -214,9 +259,9 @@ class NIHChestXRayDataset(Dataset):
             image_path = self._find_image_path(image_index)
             image = self._load_image(image_path)
             
-            # ROI Extraction: Remove artifacts and extract lung fields
+            # ROI Extraction: Remove artifacts and extract lung fields; mask out border to reduce shortcut learning
             if self.use_roi_extraction:
-                image, _ = extract_lung_roi(image)
+                image, _ = extract_lung_roi(image, apply_mask=self.apply_roi_mask)
         
         # Apply transforms (augmentation, normalization)
         # For cached images: skip resize (already 320x320), but still apply augmentation if training
@@ -232,6 +277,9 @@ class NIHChestXRayDataset(Dataset):
                 rotation_degrees = min(rotation_degrees, 10.0)  # Cap at 10 degrees as per thesis
                 if rotation_degrees > 0:
                     transform_list.append(transforms.RandomRotation(degrees=(-rotation_degrees, rotation_degrees)))
+
+                # Apply the same targeted artifact suppression to cached images
+                transform_list.append(RandomLowerArtifactErase(p=0.5))
                 transform_list.extend([
                     transforms.ToTensor(),
                     transforms.Normalize(mean=self.mean, std=self.std),
@@ -310,6 +358,7 @@ def create_dataloaders(
     use_weighted_sampling: bool = False,
     patient_split: bool = False,
     use_roi_extraction: bool = True,
+    apply_roi_mask: bool = True,
     cache_dir: Optional[Path] = None,
 ) -> Dict[str, DataLoader]:
     """
@@ -371,6 +420,12 @@ def create_dataloaders(
         print(f"   Val:   {len(val_df):,} images")
         print(f"   Test:  {len(test_df):,} images")
 
+    # Report label distribution per split (so you can verify test has Nodule/Fibrosis positives)
+    for split_name, df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+        nodule_pos = df["Finding Labels"].str.contains("Nodule", regex=False, na=False).sum()
+        fibrosis_pos = df["Finding Labels"].str.contains("Fibrosis", regex=False, na=False).sum()
+        print(f"   {split_name} label counts: Nodule positives={nodule_pos:,}, Fibrosis positives={fibrosis_pos:,}")
+
     # Create datasets
     train_dataset = NIHChestXRayDataset(
         metadata=train_df,
@@ -380,6 +435,7 @@ def create_dataloaders(
         augment=True,
         augmentation_config=augmentation_config,
         use_roi_extraction=use_roi_extraction if cache_dir is None else False,  # Disable if using cache
+        apply_roi_mask=apply_roi_mask,
         cache_dir=cache_dir,
     )
 
@@ -390,6 +446,7 @@ def create_dataloaders(
         image_size=image_size,
         augment=False,
         use_roi_extraction=use_roi_extraction if cache_dir is None else False,
+        apply_roi_mask=apply_roi_mask,
         cache_dir=cache_dir,
     )
 
@@ -400,6 +457,7 @@ def create_dataloaders(
         image_size=image_size,
         augment=False,
         use_roi_extraction=use_roi_extraction if cache_dir is None else False,
+        apply_roi_mask=apply_roi_mask,
         cache_dir=cache_dir,
     )
     

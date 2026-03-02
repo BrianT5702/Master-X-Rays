@@ -13,6 +13,7 @@ data:
   test_split: 0.1
   patient_split: true  # Patient-level splitting to prevent data leakage
   use_roi_extraction: true  # Extract lung ROI to remove artifacts and prevent shortcut learning
+  apply_roi_mask: true  # Zero out border-touching background so model focuses on lung area
 
 augmentations:
   horizontal_flip_prob: 0.5

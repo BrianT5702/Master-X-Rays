@@ -68,6 +68,7 @@ def main() -> None:
     csv_path = Path(data_cfg["csv_path"])
     augmentation_config = config.get("augmentations", {})
     use_roi_extraction = data_cfg.get("use_roi_extraction", True)
+    apply_roi_mask = data_cfg.get("apply_roi_mask", True)
     patient_split = data_cfg.get("patient_split", True)
     cache_dir = data_cfg.get("cache_dir", None)
     if cache_dir:
@@ -90,6 +91,7 @@ def main() -> None:
         use_weighted_sampling=False,
         patient_split=patient_split,
         use_roi_extraction=use_roi_extraction,
+        apply_roi_mask=apply_roi_mask,
         cache_dir=cache_dir,
     )
 

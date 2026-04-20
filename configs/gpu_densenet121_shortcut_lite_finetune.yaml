@@ -1,0 +1,93 @@
+# Gentle fine-tune — SAME augmentations as gpu_densenet121_shortcut_lite (proven val_auc ~0.674).
+# The earlier ft recipe used stronger erases + lower LR and val_auc dropped (~0.645); do not repeat that.
+# This file only: smaller LR + slightly shorter patience so you stop if val does not beat 0.6735.
+#
+#   py scripts/train.py --config configs/gpu_densenet121_shortcut_lite_finetune.yaml --resume "D:\Master File\Start\lightning_logs\csv_metrics_densenet121\version_3\checkpoints\best-auc-epoch=19-val_auc=0.6735.ckpt"
+#
+# Watch val_auc: if it does not exceed ~0.6735 within ~5 epochs, stop (Ctrl+C). If it beats it, run find_threshold + evaluate on NEW best-auc ckpt.
+#
+experiment:
+  name: gpu_densenet121_shortcut_lite_ft_gentle
+  seed: 42
+
+data:
+  nih_root: "datasets/NIH Chest X-Rays Master Datasets/archive"
+  chexpert_root: "datasets/Standford ML Group X-Rays Chest Master Datasets/cheXphoto-master/cheXphoto-master"
+  csv_path: "datasets/NIH Chest X-Rays Master Datasets/archive/Data_Entry_2017.csv"
+  image_size: [320, 320]
+  num_workers: 3
+  cache_dir: "datasets/cache"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  patient_split: true
+  use_roi_extraction: true
+  apply_roi_mask: true
+  use_normalization: true
+
+# Identical to gpu_densenet121_shortcut_lite.yaml — do not strengthen without a fresh ablation.
+augmentations:
+  legacy_cache_train_pipeline: true
+  legacy_cache_minimal_erases: false
+  horizontal_flip_prob: 0.5
+  rotation_degrees: 10.0
+  random_noise_std: 0.01
+  use_gan_synthetic: false
+  random_translate_frac: 0.035
+  corner_erase_p: 0.0
+  corner_erase_size_ratio: 0.12
+  corner_erase_per_corner_p: 0.40
+  lower_artifact_erase_p: 0.58
+  lower_artifact_erase_height_ratio: 0.26
+  lower_artifact_erase_width_ratio: 0.30
+  bottom_band_erase_p: 0.18
+  bottom_band_erase_h_min: 0.08
+  bottom_band_erase_h_max: 0.16
+  lateral_edge_erase_p: 0.15
+  lateral_edge_width_ratio: 0.05
+  top_edge_erase_p: 0.12
+  top_edge_height_ratio: 0.16
+  device_artifact_erase_p: 0.20
+  device_artifact_upper_ratio: 0.72
+  device_artifact_threshold: 224
+  device_artifact_min_area: 12
+  device_artifact_max_area_ratio: 0.020
+  device_artifact_max_components: 3
+  random_erasing_p: 0.05
+  random_erasing_scale: [0.02, 0.10]
+  random_erasing_ratio: [0.3, 3.0]
+
+training:
+  batch_size: 16
+  max_epochs: 70
+  early_stopping_patience: 6
+  precision: "16-mixed"
+  accumulate_grad_batches: 6
+  optimizer: adamw
+  learning_rate: 0.00003
+  backbone_lr_mult: 0.10
+  swa_epoch_start: null
+  weight_decay: 0.005
+  scheduler: cosine
+  warmup_epochs: 2
+  gradient_clip_val: 1.0
+  use_weighted_sampling: false
+  prediction_threshold: 0.80
+  f1_metric_threshold: 0.05
+  per_class_thresholds: [0.70, 0.75]
+
+model:
+  backbone: densenet121
+  pretrained: true
+  dropout: 0.3
+  num_classes: 2
+  class_weights: [1.0, 6.5]
+
+loss:
+  name: asymmetric
+  gamma_neg: 1.5
+  gamma_pos: 2.4
+  clip: 0.02
+  class_weight_mode: positive_only
+  bce_aux_weight: 0.15
+  label_smoothing: 0.04

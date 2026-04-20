@@ -20,43 +20,51 @@ cv2.setNumThreads(1)
 
 def _apply_body_mask(image: Image.Image) -> Image.Image:
     """
-    Zero out non-anatomical regions (padding, corners, thin borders) so the model cannot use them.
-    Does NOT zero lung tissue: only small border-touching dark components are removed (artifacts/padding).
+    Zero out only small dark blobs in the four corners (padding/artifacts). Never touch lung.
 
-    Method: Otsu → dark pixels; find connected components; zero only components that (1) touch the
-    border AND (2) are small (below fraction of image). Large border-touching dark (e.g. lung edge)
-    is kept so the lung does not look artificially cut.
+    Method: Otsu → dark pixels; connected components. Zero only if (1) small, (2) touches border,
+    AND (3) component centroid is in a corner (outer 12% of image). This avoids any black in lung.
     """
     original_mode = image.mode
     arr = np.array(image.convert("L"))
     h, w = arr.shape
     total_pixels = h * w
 
-    # Otsu: dark pixels (background, padding, and some lung)
     _, binary_dark = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         binary_dark, connectivity=8
     )
 
-    # Only zero out border-touching dark components that are SMALL (padding/artifacts, not lung)
-    # Lung or large anatomy touching the border is kept (max_remove_ratio of image area)
-    max_remove_ratio = 0.15  # Remove at most 15% of image; larger = likely lung, keep it
+    max_remove_ratio = 0.05   # Only small blobs (up to 5% of image)
+    corner_margin = 0.12      # Centroid must be in outer 12% (true corner), not along full edge
     mask = np.ones((h, w), dtype=np.uint8)
 
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         if area > total_pixels * max_remove_ratio:
-            continue  # Large component: do not zero (likely lung/body)
+            continue
+        # Centroid from bounding box
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        bw = stats[i, cv2.CC_STAT_WIDTH]
+        bh = stats[i, cv2.CC_STAT_HEIGHT]
+        cx = x + bw / 2.0
+        cy = y + bh / 2.0
+        # Only zero if centroid is in one of the four corners (not along full edge where lung can be)
+        in_left = cx < w * corner_margin
+        in_right = cx > w * (1 - corner_margin)
+        in_top = cy < h * corner_margin
+        in_bottom = cy > h * (1 - corner_margin)
+        in_corner = (in_left or in_right) and (in_top or in_bottom)
         ys, xs = np.where(labels == i)
         touches_border = (
-            np.any(xs == 0) or np.any(xs == w - 1) or
-            np.any(ys == 0) or np.any(ys == h - 1)
+            np.any(xs == 0) or np.any(xs == w - 1) or np.any(ys == 0) or np.any(ys == h - 1)
         )
-        if touches_border:
+        if touches_border and in_corner:
             mask[labels == i] = 0
 
-    # Apply mask: zero only small border-touching regions in all channels
+    # Apply mask
+
     if image.mode == "RGB":
         out = np.array(image)
         out[mask == 0, :] = 0

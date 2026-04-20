@@ -6,49 +6,87 @@ data:
   nih_root: "datasets/NIH Chest X-Rays Master Datasets/archive"
   chexpert_root: "datasets/Standford ML Group X-Rays Chest Master Datasets/cheXphoto-master/cheXphoto-master"
   csv_path: "datasets/NIH Chest X-Rays Master Datasets/archive/Data_Entry_2017.csv"
-  image_size: [320, 320]  # High-resolution input to preserve spatial fidelity of small nodules
+  image_size: [320, 320]
   num_workers: 3  # Optimal for stability - 4 workers pushed memory to 94-96% (too risky)
-  cache_dir: "datasets/cache"  # Pre-processed images cache (set to null to disable)
+  cache_dir: "datasets/cache"  # Preprocessed ROI+mask; rebuild with preprocess_images.py if you changed ROI/mask
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
   patient_split: true  # Patient-level splitting to prevent data leakage
   use_roi_extraction: true  # Will be disabled automatically if cache_dir is set
   apply_roi_mask: true  # Zero out border-touching background so model focuses on lung area (reduces shortcut learning)
+  use_normalization: true  # When true, mean/std come from data.normalization or auto from model.backbone (see datasets.resolve_data_normalization)
 
 augmentations:
+  # v29: legacy Resize + strip erases still capped ~0.54 val_auc — minimal erases + v24 loss + no oversampling next.
+  legacy_cache_train_pipeline: true
+  legacy_cache_minimal_erases: true  # flip/rot/lower-corner only; drops band/lateral/top/device during train
   horizontal_flip_prob: 0.5
-  rotation_degrees: 10.0  # Limited to ±10° for anatomical plausibility (per thesis)
-  random_noise_std: 0.02  # Increased noise for stronger regularization (was 0.01)
+  rotation_degrees: 10.0
+  random_noise_std: 0.01
   use_gan_synthetic: false
-  # Random Resized Crop (scale 0.9-1.0) is applied automatically in dataset
-  # Note: Normalization maps pixels to [-1,1] so previews look darker; contrast is preserved, features are not wiped.
+  random_translate_frac: 0.035
+  corner_erase_p: 0.55
+  corner_erase_size_ratio: 0.12
+  corner_erase_per_corner_p: 0.40
+  lower_artifact_erase_p: 0.58
+  lower_artifact_erase_height_ratio: 0.26
+  lower_artifact_erase_width_ratio: 0.30
+  # Unused when legacy_cache_minimal_erases (kept for toggling the flag off)
+  bottom_band_erase_p: 0.78
+  bottom_band_erase_h_min: 0.09
+  bottom_band_erase_h_max: 0.21
+  lateral_edge_erase_p: 0.75
+  lateral_edge_width_ratio: 0.06
+  top_edge_erase_p: 0.62
+  top_edge_height_ratio: 0.19
+  device_artifact_erase_p: 0.82
+  device_artifact_upper_ratio: 0.72
+  device_artifact_threshold: 222
+  device_artifact_min_area: 12
+  device_artifact_max_area_ratio: 0.028
+  device_artifact_max_components: 5
+  random_erasing_p: 0.0
+  random_erasing_scale: [0.02, 0.10]
+  random_erasing_ratio: [0.3, 3.0]
 
 training:
-  batch_size: 24  # Reduced to save memory (16GB RAM limit)
-  max_epochs: 40  # Upper limit; early stopping will typically stop at best AUC
-  early_stopping_patience: 6  # Stop when val_auc does not improve for 6 epochs (avoids collapse)
-  precision: "16-mixed"  # Mixed precision for faster training on GPU (saves VRAM)
-  accumulate_grad_batches: 4  # Recommended for 320x320 on 4GB VRAM
+  batch_size: 24
+  max_epochs: 55
+  early_stopping_patience: 10
+  precision: "16-mixed"
+  accumulate_grad_batches: 4  # 24 * 4 = 96 effective batch
   optimizer: adamw
-  learning_rate: 0.00005  # 5e-5 for fine-tuning; reduces metric wobbles in later epochs
-  weight_decay: 0.01  # STABLE: Back to proven baseline value
+  # Head LR; backbone uses learning_rate * backbone_lr_mult (stabilizes fine-tuning, helps val_auc)
+  learning_rate: 0.0001
+  backbone_lr_mult: 0.12
+  swa_epoch_start: null
+  weight_decay: 0.005
   scheduler: cosine
-  warmup_epochs: 5  # Gradually increase LR to stabilize DenseNet-121 backbone
-  gradient_clip_val: 1.0  # CRITICAL: Prevent gradient explosion that causes model collapse
-  use_weighted_sampling: false  # ASL handles imbalance, sampling not needed
-  prediction_threshold: 0.15  # Lowered to increase Recall/Sensitivity - flags subtle pathologies for radiological review
+  warmup_epochs: 3
+  gradient_clip_val: 1.0
+  # false: matches base.yaml / reduces oversampling artifact-heavy positives (v29 train F1 ~0.97, val_auc ~0.53)
+  use_weighted_sampling: false
+  prediction_threshold: 0.80  # Rough default when a single threshold is needed; per_class_thresholds preferred
+  f1_metric_threshold: 0.05   # Used only if per_class_thresholds is omitted (single threshold for multilabel F1/acc)
+  # Separate decision thresholds per label for logged F1/acc (recommended). Tune via:
+  #   python scripts/find_threshold.py --checkpoint <best-auc.ckpt> --config configs/gpu.yaml --split val
+  # After EACH new run/backbone: python scripts/find_threshold.py --checkpoint <best.ckpt> --config configs/gpu.yaml --split val
+  # Wrong thresholds crush reported F1 even when AUC is OK (e.g. DenseNet vs EfficientNet logits differ).
+  per_class_thresholds: [0.80, 0.90]  # [Nodule, Fibrosis] — replace from find_threshold output
 
 model:
-  backbone: densenet121
+  backbone: efficientnet_b0
   pretrained: true
-  dropout: 0.3  # INCREASED: Higher dropout to prevent overfitting after ASL fix (was 0.25)
+  dropout: 0.3
   num_classes: 2
-  class_weights: [1.0, 4.0]  # Balanced emphasis on Fibrosis (2–4x range from Gemini) to avoid over-correction
+  class_weights: [1.0, 6.5]
 
 loss:
-  name: asymmetric  # Asymmetric Loss (ASL) for extreme class imbalance
-  gamma_neg: 2.0  # Reduced to "thaw" gradients; keeps loss from collapsing so model keeps learning
-  gamma_pos: 1.0  # Keep at 1.0 to let rare positive confidences grow
-  clip: 0.01  # Lower clip allows more gradient signal for rare diseases to cross threshold
-  bce_aux_weight: 0.1  # Auxiliary BCE keeps gradients alive when ASL collapses; improves AUC/F1
+  name: asymmetric
+  gamma_neg: 1.5
+  gamma_pos: 2.4
+  clip: 0.02
+  class_weight_mode: positive_only
+  bce_aux_weight: 0.15  # slightly lower to reduce early val_loss spikes with ASL
+  label_smoothing: 0.04

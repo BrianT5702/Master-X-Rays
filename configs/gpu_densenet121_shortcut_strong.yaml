@@ -1,0 +1,86 @@
+# DenseNet-121 shortcut-control experiment (STRONG)
+# Goal: aggressive shortcut suppression if lite/mid still focus on devices/lower band.
+experiment:
+  name: gpu_densenet121_shortcut_strong
+  seed: 42
+
+data:
+  nih_root: "datasets/NIH Chest X-Rays Master Datasets/archive"
+  chexpert_root: "datasets/Standford ML Group X-Rays Chest Master Datasets/cheXphoto-master/cheXphoto-master"
+  csv_path: "datasets/NIH Chest X-Rays Master Datasets/archive/Data_Entry_2017.csv"
+  image_size: [320, 320]
+  num_workers: 3
+  cache_dir: "datasets/cache"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  patient_split: true
+  use_roi_extraction: true
+  apply_roi_mask: true
+  use_normalization: true
+
+augmentations:
+  legacy_cache_train_pipeline: true
+  legacy_cache_minimal_erases: false
+  horizontal_flip_prob: 0.5
+  rotation_degrees: 10.0
+  random_noise_std: 0.01
+  use_gan_synthetic: false
+  random_translate_frac: 0.035
+  corner_erase_p: 0.0
+  corner_erase_size_ratio: 0.12
+  corner_erase_per_corner_p: 0.40
+  lower_artifact_erase_p: 0.70
+  lower_artifact_erase_height_ratio: 0.30
+  lower_artifact_erase_width_ratio: 0.34
+  bottom_band_erase_p: 0.42
+  bottom_band_erase_h_min: 0.09
+  bottom_band_erase_h_max: 0.20
+  lateral_edge_erase_p: 0.35
+  lateral_edge_width_ratio: 0.06
+  top_edge_erase_p: 0.30
+  top_edge_height_ratio: 0.18
+  device_artifact_erase_p: 0.42
+  device_artifact_upper_ratio: 0.72
+  device_artifact_threshold: 222
+  device_artifact_min_area: 10
+  device_artifact_max_area_ratio: 0.024
+  device_artifact_max_components: 4
+  random_erasing_p: 0.15
+  random_erasing_scale: [0.02, 0.10]
+  random_erasing_ratio: [0.3, 3.0]
+
+training:
+  batch_size: 16
+  max_epochs: 55
+  early_stopping_patience: 10
+  precision: "16-mixed"
+  accumulate_grad_batches: 6
+  optimizer: adamw
+  learning_rate: 0.0001
+  backbone_lr_mult: 0.12
+  swa_epoch_start: null
+  weight_decay: 0.005
+  scheduler: cosine
+  warmup_epochs: 3
+  gradient_clip_val: 1.0
+  use_weighted_sampling: false
+  prediction_threshold: 0.80
+  f1_metric_threshold: 0.05
+  per_class_thresholds: [0.70, 0.75]
+
+model:
+  backbone: densenet121
+  pretrained: true
+  dropout: 0.3
+  num_classes: 2
+  class_weights: [1.0, 6.5]
+
+loss:
+  name: asymmetric
+  gamma_neg: 1.5
+  gamma_pos: 2.4
+  clip: 0.02
+  class_weight_mode: positive_only
+  bce_aux_weight: 0.15
+  label_smoothing: 0.04

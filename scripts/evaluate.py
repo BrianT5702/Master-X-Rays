@@ -14,7 +14,7 @@ import torch
 import pytorch_lightning as pl
 import yaml
 
-from src.data.datasets import create_dataloaders
+from src.data.datasets import create_dataloaders, resolve_data_normalization
 from src.models.basemodels import build_backbone
 from src.training.lightning_module import RareDiseaseModule
 
@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("configs/gpu.yaml"),
         help="Config used for training.",
+    )
+    parser.add_argument(
+        "--split",
+        choices=["train", "val", "test"],
+        default="test",
+        help="Dataset split to evaluate (default: test).",
     )
     parser.add_argument(
         "--heatmaps",
@@ -69,6 +75,10 @@ def main() -> None:
     augmentation_config = config.get("augmentations", {})
     use_roi_extraction = data_cfg.get("use_roi_extraction", True)
     apply_roi_mask = data_cfg.get("apply_roi_mask", True)
+    use_normalization = data_cfg.get("use_normalization", False)
+    normalization = resolve_data_normalization(
+        data_cfg.get("normalization"), model_cfg["backbone"]
+    )
     patient_split = data_cfg.get("patient_split", True)
     cache_dir = data_cfg.get("cache_dir", None)
     if cache_dir:
@@ -92,7 +102,9 @@ def main() -> None:
         patient_split=patient_split,
         use_roi_extraction=use_roi_extraction,
         apply_roi_mask=apply_roi_mask,
+        use_normalization=use_normalization,
         cache_dir=cache_dir,
+        normalization=normalization,
     )
 
     backbone = build_backbone(
@@ -104,6 +116,8 @@ def main() -> None:
 
     class_weights = model_cfg.get("class_weights", None)
     prediction_threshold = training_cfg.get("prediction_threshold", 0.3)
+    f1_metric_threshold = training_cfg.get("f1_metric_threshold", 0.05)
+    per_class_thresholds = training_cfg.get("per_class_thresholds")
     warmup_epochs = training_cfg.get("warmup_epochs", 0)
 
     ckpt_path = Path(args.checkpoint)
@@ -114,6 +128,7 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Loading checkpoint: {ckpt_path}")
+    backbone_lr_mult = float(training_cfg.get("backbone_lr_mult", 1.0))
     lightning_module = RareDiseaseModule.load_from_checkpoint(
         str(ckpt_path),
         model=backbone,
@@ -125,6 +140,9 @@ def main() -> None:
         prediction_threshold=prediction_threshold,
         samples_per_class=model_cfg.get("samples_per_class", None),
         warmup_epochs=warmup_epochs,
+        f1_metric_threshold=f1_metric_threshold,
+        per_class_thresholds=per_class_thresholds,
+        backbone_lr_mult=backbone_lr_mult,
         map_location="cpu",
     )
 
@@ -138,8 +156,8 @@ def main() -> None:
         enable_progress_bar=True,
     )
 
-    print("Running test set evaluation...")
-    trainer.test(lightning_module, dataloaders["test"])
+    print(f"Running evaluation on split: {args.split}")
+    trainer.test(lightning_module, dataloaders=dataloaders[args.split])
 
     if args.heatmaps:
         import subprocess
@@ -150,11 +168,19 @@ def main() -> None:
                 sys.executable, str(heatmap_script),
                 "--checkpoint", str(ckpt_path),
                 "--config", str(args.config),
-                "--split", "test",
+                "--split", args.split,
                 "--num_samples", str(args.heatmap_samples),
                 "--output_dir", str(PROJECT_ROOT / "heatmaps"),
+                "--method", "hires_cam",
+                "--target_layer_mode", "high_res",
+                "--heatmap_blur_kernel", "0",
+                "--heatmap_spread_gamma", "1.35",
+                "--heatmap_pct_low", "3",
+                "--heatmap_pct_high", "97",
+                "--heatmap_upsample", "bicubic",
+                "--heatmap_zero_border_frac", "0.02",
             ], check=True, cwd=str(PROJECT_ROOT))
-            print("Heatmaps saved under heatmaps/test/gradcam/version_XX/")
+            print("Heatmaps saved under heatmaps/<split>/hires_cam/<backbone>/version_XX/")
         else:
             print("Heatmap script not found; skipping heatmaps.")
 

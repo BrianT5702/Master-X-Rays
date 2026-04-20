@@ -1,0 +1,94 @@
+# EfficientNet-B2 — second-stage recipe aimed at higher macro AUC + usable F1.
+# Changes vs gpu_efficientnet_b2_shortcut_lite.yaml:
+#   - WeightedRandomSampler on train (more positive / multi-label batches → better rare-class F1 & often AUC)
+#   - Slightly stronger fibrosis class weight, less label smoothing, modest ASL/BCE tweaks
+#   - Slightly higher device-artifact erase (reduce hardware shortcuts seen in CAMs)
+#
+# Train fresh (recommended): py scripts/train.py --config configs/gpu_efficientnet_b2_push_metrics.yaml
+# Then: find_threshold.py (uses fine refinement by default) → per_class_thresholds → evaluate.py
+#
+experiment:
+  name: gpu_efficientnet_b2_push_metrics
+  seed: 42
+
+data:
+  nih_root: "datasets/NIH Chest X-Rays Master Datasets/archive"
+  chexpert_root: "datasets/Standford ML Group X-Rays Master Datasets/cheXphoto-master/cheXphoto-master"
+  csv_path: "datasets/NIH Chest X-Rays Master Datasets/archive/Data_Entry_2017.csv"
+  image_size: [320, 320]
+  num_workers: 3
+  cache_dir: "datasets/cache"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  patient_split: true
+  use_roi_extraction: true
+  apply_roi_mask: true
+  use_normalization: true
+
+augmentations:
+  legacy_cache_train_pipeline: true
+  legacy_cache_minimal_erases: false
+  horizontal_flip_prob: 0.5
+  rotation_degrees: 10.0
+  random_noise_std: 0.01
+  use_gan_synthetic: false
+  random_translate_frac: 0.035
+  corner_erase_p: 0.0
+  corner_erase_size_ratio: 0.12
+  corner_erase_per_corner_p: 0.40
+  lower_artifact_erase_p: 0.58
+  lower_artifact_erase_height_ratio: 0.26
+  lower_artifact_erase_width_ratio: 0.30
+  bottom_band_erase_p: 0.18
+  bottom_band_erase_h_min: 0.08
+  bottom_band_erase_h_max: 0.16
+  lateral_edge_erase_p: 0.15
+  lateral_edge_width_ratio: 0.05
+  top_edge_erase_p: 0.12
+  top_edge_height_ratio: 0.16
+  device_artifact_erase_p: 0.28
+  device_artifact_upper_ratio: 0.72
+  device_artifact_threshold: 224
+  device_artifact_min_area: 12
+  device_artifact_max_area_ratio: 0.020
+  device_artifact_max_components: 3
+  random_erasing_p: 0.05
+  random_erasing_scale: [0.02, 0.10]
+  random_erasing_ratio: [0.3, 3.0]
+
+training:
+  batch_size: 10
+  max_epochs: 60
+  early_stopping_patience: 12
+  precision: "16-mixed"
+  accumulate_grad_batches: 10
+  optimizer: adamw
+  learning_rate: 0.0001
+  backbone_lr_mult: 0.25
+  swa_epoch_start: null
+  weight_decay: 0.005
+  scheduler: cosine
+  warmup_epochs: 3
+  gradient_clip_val: 1.0
+  use_weighted_sampling: true
+  prediction_threshold: 0.80
+  f1_metric_threshold: 0.05
+  # Val: find_threshold.py + best-auc-epoch=05-val_auc=0.6763.ckpt (refined).
+  per_class_thresholds: [0.7900, 0.7900]
+
+model:
+  backbone: efficientnet_b2
+  pretrained: true
+  dropout: 0.2
+  num_classes: 2
+  class_weights: [1.0, 7.0]
+
+loss:
+  name: asymmetric
+  gamma_neg: 1.5
+  gamma_pos: 2.5
+  clip: 0.02
+  class_weight_mode: positive_only
+  bce_aux_weight: 0.18
+  label_smoothing: 0.02

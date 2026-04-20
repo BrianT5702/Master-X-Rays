@@ -1,11 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_lightning import LightningModule
-from torchmetrics.classification import MultilabelAUROC, MultilabelF1Score, MultilabelAccuracy
+from torchmetrics.classification import (
+    BinaryAccuracy,
+    BinaryAUROC,
+    BinaryF1Score,
+    MultilabelAUROC,
+    MultilabelAccuracy,
+    MultilabelF1Score,
+)
 
 
 def focal_loss(
@@ -45,6 +53,7 @@ def asymmetric_loss(
     eps: float = 1e-8,
     reduction: str = "mean",
     class_weights: Optional[torch.Tensor] = None,
+    class_weight_mode: str = "positive_only",
 ) -> torch.Tensor:
     """
     Asymmetric Loss (ASL) for multi-label classification with extreme class imbalance.
@@ -94,11 +103,17 @@ def asymmetric_loss(
     
     loss = loss_pos + loss_neg
     
-    # Apply class weights if provided (critical for rare class prioritization)
+    # Apply class weights if provided.
+    # positive_only: upweight only positive targets for rare diseases (recommended)
+    # all: legacy behavior, scales both positive and negative terms per class
     if class_weights is not None:
         class_weights = class_weights.to(loss.device)
-        # Expand weights to match batch and class dimensions: [num_classes] -> [batch, num_classes]
-        weight_tensor = class_weights.unsqueeze(0).expand_as(loss)
+        if class_weight_mode == "positive_only":
+            # [B, C]: positives get class weight, negatives stay weight=1
+            weight_tensor = 1.0 + (class_weights.unsqueeze(0) - 1.0) * targets
+        else:
+            # [num_classes] -> [batch, num_classes]
+            weight_tensor = class_weights.unsqueeze(0).expand_as(loss)
         loss = loss * weight_tensor
     
     if reduction == "mean":
@@ -146,6 +161,49 @@ def class_balanced_loss(
     return cb_loss
 
 
+def _adamw_param_groups(
+    model: nn.Module,
+    learning_rate: float,
+    weight_decay: float,
+    backbone_lr_mult: float,
+) -> List[Dict[str, Any]]:
+    """Split torchvision CNN/Swin blocks vs classifier head for transfer learning."""
+    if backbone_lr_mult >= 0.999:
+        return [
+            {
+                "params": [p for p in model.parameters() if p.requires_grad],
+                "lr": learning_rate,
+                "weight_decay": weight_decay,
+            }
+        ]
+    backbone_params: List[nn.Parameter] = []
+    head_params: List[nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        top = name.split(".", 1)[0]
+        if top in ("classifier", "fc", "head"):
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+    if not backbone_params or not head_params:
+        return [
+            {
+                "params": [p for p in model.parameters() if p.requires_grad],
+                "lr": learning_rate,
+                "weight_decay": weight_decay,
+            }
+        ]
+    return [
+        {
+            "params": backbone_params,
+            "lr": learning_rate * backbone_lr_mult,
+            "weight_decay": weight_decay,
+        },
+        {"params": head_params, "lr": learning_rate, "weight_decay": weight_decay},
+    ]
+
+
 class RareDiseaseModule(LightningModule):
     """LightningModule encapsulating the training loop for multilabel classification."""
 
@@ -160,11 +218,15 @@ class RareDiseaseModule(LightningModule):
         prediction_threshold: float = 0.3,
         samples_per_class: Optional[Iterable[float]] = None,
         warmup_epochs: int = 0,
+        f1_metric_threshold: Optional[float] = None,
+        per_class_thresholds: Optional[Union[List[float], Iterable[float]]] = None,
+        backbone_lr_mult: float = 1.0,
     ) -> None:
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.backbone_lr_mult = backbone_lr_mult
         self.class_weights = (
             torch.tensor(class_weights, dtype=torch.float32) if class_weights is not None else None
         )
@@ -175,37 +237,81 @@ class RareDiseaseModule(LightningModule):
         self.max_epochs = max_epochs
         self.prediction_threshold = prediction_threshold
         self.warmup_epochs = warmup_epochs
+        # Use a lower threshold for F1 metric so it responds during training (ASL keeps probs modest)
+        self._f1_threshold = f1_metric_threshold if f1_metric_threshold is not None else prediction_threshold
 
         num_classes = getattr(model, "num_classes", None)
         if num_classes is None:
             raise ValueError("Model must expose `num_classes` attribute for metrics initialization.")
 
-        self.train_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=prediction_threshold)
-        self.val_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=prediction_threshold)
-        self.test_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=prediction_threshold)
+        thr_list: Optional[List[float]] = None
+        if per_class_thresholds is not None:
+            thr_list = [float(t) for t in list(per_class_thresholds)]
+            if len(thr_list) != num_classes:
+                raise ValueError(
+                    f"per_class_thresholds must have length {num_classes}, got {len(thr_list)}"
+                )
+        self._use_per_class_thr = thr_list is not None
+
+        if self._use_per_class_thr:
+            # Separate threshold per label (Nodule, Fibrosis) — macro F1 = mean of per-class F1
+            for stage in ("train", "val", "test"):
+                f1_bins = nn.ModuleList(
+                    [BinaryF1Score(threshold=thr_list[i]) for i in range(num_classes)]  # type: ignore[index]
+                )
+                acc_bins = nn.ModuleList(
+                    [BinaryAccuracy(threshold=thr_list[i]) for i in range(num_classes)]  # type: ignore[index]
+                )
+                setattr(self, f"{stage}_f1_bins", f1_bins)
+                setattr(self, f"{stage}_acc_bins", acc_bins)
+            # Placeholders so old code paths can reference (not updated when per-class mode)
+            self.train_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
+            self.val_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
+            self.test_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
+            self.val_acc = MultilabelAccuracy(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
+            self.test_acc = MultilabelAccuracy(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
+        else:
+            self.train_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
+            self.val_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
+            self.test_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
+            self.val_acc = MultilabelAccuracy(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
+            self.test_acc = MultilabelAccuracy(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
 
         self.val_auc = MultilabelAUROC(num_labels=num_classes, average="macro")
         self.test_auc = MultilabelAUROC(num_labels=num_classes, average="macro")
-
-        self.val_acc = MultilabelAccuracy(num_labels=num_classes, average="macro")
-        self.test_acc = MultilabelAccuracy(num_labels=num_classes, average="macro")
+        # Per-class AUROC (macro alone can hide a dead label)
+        self.val_auc_nodule = BinaryAUROC()
+        self.val_auc_fibrosis = BinaryAUROC()
+        self.test_auc_nodule = BinaryAUROC()
+        self.test_auc_fibrosis = BinaryAUROC()
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return self.model(images)
 
+    def _forward_logits(self, images: torch.Tensor, stage: str) -> torch.Tensor:
+        """Train uses Lightning AMP; val/test disable autocast so loss/AUC are finite in 16-mixed."""
+        if stage in ("val", "test") and images.is_cuda:
+            with torch.autocast(device_type="cuda", enabled=False):
+                return self.model(images)
+        return self.model(images)
+
     def configure_optimizers(self) -> Dict[str, Any]:
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+        param_groups = _adamw_param_groups(
+            self.model, self.learning_rate, self.weight_decay, self.backbone_lr_mult
         )
-        
+        optimizer = torch.optim.AdamW(param_groups)
+
         # Implement warmup + cosine annealing
+        cos_floor = max(1e-8, float(self.learning_rate) * 0.01)
         if self.warmup_epochs > 0:
             # Linear warmup followed by cosine annealing
             warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
                 optimizer, start_factor=0.01, end_factor=1.0, total_iters=self.warmup_epochs
             )
             cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=self.max_epochs - self.warmup_epochs, eta_min=self.learning_rate * 0.01
+                optimizer,
+                T_max=self.max_epochs - self.warmup_epochs,
+                eta_min=cos_floor,
             )
             # Chain warmup then cosine annealing
             scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -216,15 +322,18 @@ class RareDiseaseModule(LightningModule):
         else:
             # No warmup, just cosine annealing
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=self.max_epochs, eta_min=self.learning_rate * 0.01
+                optimizer, T_max=self.max_epochs, eta_min=cos_floor
             )
         
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
-    def _shared_step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
+    def _shared_step(self, batch: Dict[str, Any], stage: str) -> torch.Tensor:
         images = batch["image"]
         labels = batch["labels"]
-        logits = self(images)
+        batch_size = int(images.shape[0])
+        logits = self._forward_logits(images, stage)
+        if stage in ("val", "test"):
+            logits = torch.clamp(logits, -50.0, 50.0)
 
         # Select loss function based on config
         loss_name = self.loss_config.get("name", "asymmetric")
@@ -234,14 +343,26 @@ class RareDiseaseModule(LightningModule):
             gamma_neg = self.loss_config.get("gamma_neg", 4.0)
             gamma_pos = self.loss_config.get("gamma_pos", 1.0)
             clip = self.loss_config.get("clip", 0.2)
+            class_weight_mode = self.loss_config.get("class_weight_mode", "positive_only")
             loss = asymmetric_loss(
-                logits, labels, gamma_neg=gamma_neg, gamma_pos=gamma_pos, clip=clip, reduction="mean",
-                class_weights=self.class_weights  # Apply class weights to ASL (critical fix)
+                logits,
+                labels,
+                gamma_neg=gamma_neg,
+                gamma_pos=gamma_pos,
+                clip=clip,
+                reduction="mean",
+                class_weights=self.class_weights,
+                class_weight_mode=class_weight_mode,
             )
-            # Auxiliary BCE keeps gradient signal when ASL collapses (prevents loss → 0, improves AUC/F1)
+            # Auxiliary BCE keeps gradient signal when ASL collapses; label smoothing reduces overconfidence
             bce_aux_weight = self.loss_config.get("bce_aux_weight", 0.0)
+            label_smoothing = self.loss_config.get("label_smoothing", 0.0)
             if bce_aux_weight > 0:
-                bce_aux = F.binary_cross_entropy_with_logits(logits, labels, reduction="mean")
+                targets_bce = labels
+                if label_smoothing > 0:
+                    # Soft labels: 0 -> eps, 1 -> 1-eps (reduces overconfident predictions, fewer FPs)
+                    targets_bce = labels * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                bce_aux = F.binary_cross_entropy_with_logits(logits, targets_bce, reduction="mean")
                 loss = loss + bce_aux_weight * bce_aux
         elif loss_name == "focal":
             alpha = self.loss_config.get("alpha", 0.75)
@@ -273,28 +394,103 @@ class RareDiseaseModule(LightningModule):
         else:  # Default: standard BCE
             loss = F.binary_cross_entropy_with_logits(logits, labels)
 
+        if stage in ("val", "test") and not torch.isfinite(loss):
+            loss = torch.zeros((), device=loss.device, dtype=torch.float32)
+
         preds = torch.sigmoid(logits)
         metrics = {
             "f1": getattr(self, f"{stage}_f1"),
             "auc": getattr(self, f"{stage}_auc", None),
             "acc": getattr(self, f"{stage}_acc", None),
         }
-        metrics["f1"](preds, labels.int())
+
+        if self._use_per_class_thr:
+            f1_bins = getattr(self, f"{stage}_f1_bins")
+            acc_bins = getattr(self, f"{stage}_acc_bins")
+            for i in range(len(f1_bins)):
+                f1_bins[i](preds[:, i], labels[:, i].int())
+                acc_bins[i](preds[:, i], labels[:, i].int())
+        else:
+            metrics["f1"](preds, labels.int())
+            if metrics["acc"] is not None:
+                metrics["acc"](preds, labels.int())
+
         if metrics["auc"] is not None:
             metrics["auc"](preds, labels.int())
-        if metrics["acc"] is not None:
-            metrics["acc"](preds, labels.int())
+
+        if stage == "val":
+            self.val_auc_nodule(preds[:, 0], labels[:, 0].int())
+            self.val_auc_fibrosis(preds[:, 1], labels[:, 1].int())
+        elif stage == "test":
+            self.test_auc_nodule(preds[:, 0], labels[:, 0].int())
+            self.test_auc_fibrosis(preds[:, 1], labels[:, 1].int())
 
         # Log only epoch-level metrics to avoid thousands of per-step rows in metrics.csv
-        # (one aggregated value per epoch for each metric)
-        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"{stage}_f1", metrics["f1"], prog_bar=True, on_step=False, on_epoch=True)
+        log_kw = {"on_step": False, "on_epoch": True, "batch_size": batch_size}
+        self.log(f"{stage}_loss", loss, prog_bar=True, **log_kw)
+        if not self._use_per_class_thr:
+            self.log(f"{stage}_f1", metrics["f1"], prog_bar=True, **log_kw)
+            if metrics["acc"] is not None:
+                self.log(f"{stage}_acc", metrics["acc"], prog_bar=False, **log_kw)
         if metrics["auc"] is not None:
-            self.log(f"{stage}_auc", metrics["auc"], prog_bar=True, on_step=False, on_epoch=True)
-        if metrics["acc"] is not None:
-            self.log(f"{stage}_acc", metrics["acc"], prog_bar=False, on_step=False, on_epoch=True)
+            self.log(f"{stage}_auc", metrics["auc"], prog_bar=True, **log_kw)
+        if stage == "val":
+            self.log("val_auc_nodule", self.val_auc_nodule, prog_bar=False, **log_kw)
+            self.log("val_auc_fibrosis", self.val_auc_fibrosis, prog_bar=False, **log_kw)
+        elif stage == "test":
+            self.log("test_auc_nodule", self.test_auc_nodule, prog_bar=False, **log_kw)
+            self.log("test_auc_fibrosis", self.test_auc_fibrosis, prog_bar=False, **log_kw)
+        finite = torch.isfinite(preds)
+        mean_pred = preds[finite].mean() if finite.any() else preds.new_zeros(())
+        if stage in ("val", "test"):
+            self.log(f"{stage}_mean_pred", mean_pred, prog_bar=False, **log_kw)
 
         return loss
+
+    def _log_per_class_epoch_metrics(self, stage: str) -> None:
+        """Compute macro F1/acc from per-class Binary metrics and log (incl. val_f1 for checkpoints)."""
+        f1_bins = getattr(self, f"{stage}_f1_bins")
+        acc_bins = getattr(self, f"{stage}_acc_bins")
+        f1s = [m.compute() for m in f1_bins]
+        accs = [m.compute() for m in acc_bins]
+        for m in f1_bins:
+            m.reset()
+        for m in acc_bins:
+            m.reset()
+        macro_f1 = torch.stack(
+            [x.detach() if isinstance(x, torch.Tensor) else torch.tensor(float(x)) for x in f1s]
+        ).mean()
+        macro_acc = torch.stack(
+            [x.detach() if isinstance(x, torch.Tensor) else torch.tensor(float(x)) for x in accs]
+        ).mean()
+        class_names = ("nodule", "fibrosis")
+        end_kw = {"on_step": False, "on_epoch": True, "batch_size": 1}
+        for i, name in enumerate(class_names):
+            self.log(f"{stage}_f1_{name}", f1s[i], prog_bar=False, **end_kw)
+            self.log(f"{stage}_acc_{name}", accs[i], prog_bar=False, **end_kw)
+        self.log(f"{stage}_f1_macro_per_class", macro_f1, prog_bar=False, **end_kw)
+        self.log(f"{stage}_acc_macro_per_class", macro_acc, prog_bar=False, **end_kw)
+        if stage == "train":
+            self.log("train_f1", macro_f1, prog_bar=True, **end_kw)
+            self.log("train_acc", macro_acc, prog_bar=False, **end_kw)
+        elif stage == "val":
+            self.log("val_f1", macro_f1, prog_bar=True, **end_kw)
+            self.log("val_acc", macro_acc, prog_bar=False, **end_kw)
+        elif stage == "test":
+            self.log("test_f1", macro_f1, prog_bar=False, **end_kw)
+            self.log("test_acc", macro_acc, prog_bar=False, **end_kw)
+
+    def on_train_epoch_end(self) -> None:
+        if self._use_per_class_thr:
+            self._log_per_class_epoch_metrics("train")
+
+    def on_validation_epoch_end(self) -> None:
+        if self._use_per_class_thr:
+            self._log_per_class_epoch_metrics("val")
+
+    def on_test_epoch_end(self) -> None:
+        if self._use_per_class_thr:
+            self._log_per_class_epoch_metrics("test")
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         return self._shared_step(batch, "train")

@@ -33,7 +33,9 @@ def preprocess_images(
     cache_dir: Path,
     image_size: tuple[int, int] = (320, 320),
     use_roi_extraction: bool = True,
+    apply_roi_mask: bool = True,
     label_columns: list[str] | None = None,
+    overwrite_existing: bool = False,
 ) -> None:
     """
     Pre-process all images: extract ROI, resize, and save to cache.
@@ -100,16 +102,23 @@ def preprocess_images(
     
     print("[INFO] Using JPEG format for cache (faster loading, ~3-5x speedup vs PNG)")
     
-    # Save metadata to cache
+    # Save metadata to cache. Training uses the original CSV, so this is for reference only.
     metadata_cache_path = cache_dir / "metadata.csv"
-    metadata.to_csv(metadata_cache_path, index=False)
-    print(f"[INFO] Saved metadata to {metadata_cache_path}")
+    metadata_tmp = cache_dir / "metadata.csv.tmp"
+    metadata.to_csv(metadata_tmp, index=False)
+    try:
+        os.replace(metadata_tmp, metadata_cache_path)
+        print(f"[INFO] Saved metadata to {metadata_cache_path}")
+    except PermissionError:
+        # metadata.csv is locked (e.g. open in Excel). Keep .tmp; training still works (uses original CSV).
+        print(f"[INFO] Saved metadata to {metadata_tmp} (metadata.csv is locked; training uses the original CSV anyway)")
     
     # Process images
     print(f"[INFO] Processing {len(metadata):,} images...")
     print(f"   Cache directory: {processed_dir}")
     print(f"   Format: JPEG (quality=95) - 3-5x faster loading than PNG")
     print(f"   ROI extraction: {'Enabled' if use_roi_extraction else 'Disabled'}")
+    print(f"   Body mask (reduce shortcut): {'Yes' if (use_roi_extraction and apply_roi_mask) else 'No'}")
     print(f"   Target size: {image_size}")
     
     failed = []
@@ -119,12 +128,16 @@ def preprocess_images(
         image_index = row["Image Index"]
         cache_path = processed_dir / image_index
         
-        # Skip if already processed (check both .png and .jpg for backward compatibility)
+        # Skip if already processed (unless overwrite requested)
         cache_path_jpg = cache_path.with_suffix('.jpg')
         cache_path_png = cache_path.with_suffix('.png')
-        if cache_path_jpg.exists() or cache_path_png.exists():
+        if not overwrite_existing and (cache_path_jpg.exists() or cache_path_png.exists()):
             success += 1
             continue
+        # Remove old file if overwriting (e.g. different suffix)
+        for p in (cache_path_jpg, cache_path_png):
+            if p.exists():
+                p.unlink()
         
         try:
             # Find original image
@@ -133,9 +146,9 @@ def preprocess_images(
             # Load image
             image = Image.open(image_path).convert("RGB")
             
-            # Extract ROI if enabled
+            # Extract ROI (and body mask) if enabled - same pipeline as training
             if use_roi_extraction:
-                image, _ = extract_lung_roi(image)
+                image, _ = extract_lung_roi(image, apply_mask=apply_roi_mask)
             
             # Resize to target size
             image = image.resize(image_size, Image.Resampling.BILINEAR)
@@ -203,6 +216,8 @@ def main() -> None:
     parser.add_argument("--cache-dir", type=Path, default=Path("datasets/cache"), help="Cache directory for processed images")
     parser.add_argument("--image-size", type=int, nargs=2, default=[320, 320], help="Target image size (height width)")
     parser.add_argument("--no-roi", action="store_true", help="Disable ROI extraction")
+    parser.add_argument("--no-mask", action="store_true", help="Disable body mask (only when using ROI)")
+    parser.add_argument("--overwrite", action="store_true", help="Re-process all images (rebuild cache with current ROI/mask)")
     parser.add_argument("--labels", nargs="+", default=["Nodule", "Fibrosis"], help="Filter for specific labels")
     
     args = parser.parse_args()
@@ -213,7 +228,9 @@ def main() -> None:
         cache_dir=args.cache_dir,
         image_size=tuple(args.image_size),
         use_roi_extraction=not args.no_roi,
+        apply_roi_mask=not args.no_mask,
         label_columns=args.labels if args.labels else None,
+        overwrite_existing=args.overwrite,
     )
 
 

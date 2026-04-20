@@ -16,64 +16,138 @@ def visualize_heatmap(
     image: torch.Tensor,
     heatmap: torch.Tensor,
     save_path: Optional[Path] = None,
-    alpha: float = 0.6,
+    alpha: float = 0.38,
     cmap: str = "jet",
     show: bool = True,
+    ghosted_overlay: bool = True,
+    figure_title: Optional[str] = None,
+    heatmap_blur_kernel: int = 0,
+    heatmap_spread_gamma: float = 1.0,
+    heatmap_zero_border_frac: float = 0.0,
+    heatmap_percentile_low: float = 0.0,
+    heatmap_percentile_high: float = 100.0,
+    heatmap_upsample_mode: str = "bicubic",
 ) -> None:
     """
     Visualize heatmap overlaid on original image.
 
     Args:
-        image: Original image tensor (C, H, W) or (H, W, C)
-        heatmap: Heatmap tensor (H, W)
+        image: Original image tensor (C, H, W), normalized with mean=0.5, std=0.5 (range [-1,1])
+        heatmap: Heatmap tensor (H, W), typically min-max normalized to [0,1] by Grad-CAM
         save_path: Path to save visualization
         alpha: Transparency of heatmap overlay
-        cmap: Colormap for heatmap
+        cmap: Colormap for heatmap (jet = blue low, red high)
         show: Whether to display the plot
+        ghosted_overlay: If True, overlay uses a grayscale copy of the image at full contrast (no dimming).
+            If False, uses the same RGB/RGBA tensor as the Original panel.
+        figure_title: Optional suptitle (e.g. image id + target class) so saved PNGs are easy to tell apart
+        heatmap_blur_kernel: Optional odd kernel size for smoothing the heatmap (0 disables)
+        heatmap_spread_gamma: Gamma applied to heatmap in [0,1]; values <1.0 expand highlighted area;
+            values >1.0 suppress weak activations (less green wash, peaks stand out).
+        heatmap_zero_border_frac: If >0, zero outer fraction of min(H,W) on each side then renormalize.
+            Reduces misleading hot spots on the image frame (display only; does not change the model).
+        heatmap_percentile_low / heatmap_percentile_high: If not (0, 100), contrast-stretch using
+            these percentiles (clamps tails) so mid-level noise maps to cooler colors.
+        heatmap_upsample_mode: "bicubic" or "bilinear" when resizing CAM to image size.
     """
-    # Convert image to numpy
+    # Convert image to numpy and denormalize
     if isinstance(image, torch.Tensor):
-        # Denormalize if needed (assuming ImageNet normalization)
-        if image.max() <= 1.0 and image.min() >= 0.0:
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            image = image * std + mean
         image = image.permute(1, 2, 0).cpu().numpy()
+        # Our dataset uses Normalize(mean=0.5, std=0.5) -> values in [-1, 1]. Reverse: x*0.5+0.5
+        if image.min() < 0 or image.max() > 1.01:  # Likely [-1,1] normalized
+            image = image * 0.5 + 0.5
         image = np.clip(image, 0, 1)
 
-    # Convert heatmap to numpy
+    # Convert heatmap to numpy; Grad-CAM already min-max normalizes to [0,1]
     if isinstance(heatmap, torch.Tensor):
         heatmap = heatmap.cpu().numpy()
+    # Base [0,1] mapping, then optional percentile contrast (reduces vague green regions)
+    h_min, h_max = float(heatmap.min()), float(heatmap.max())
+    if h_max - h_min > 1e-8:
+        heatmap = (heatmap - h_min) / (h_max - h_min)
+    heatmap = np.clip(heatmap, 0, 1)
+
+    use_pct = (
+        heatmap_percentile_low > 0.0
+        or heatmap_percentile_high < 100.0
+    ) and heatmap_percentile_high > heatmap_percentile_low + 1e-6
+    if use_pct:
+        flat = heatmap.ravel()
+        lo = float(np.percentile(flat, heatmap_percentile_low))
+        hi = float(np.percentile(flat, heatmap_percentile_high))
+        if hi - lo > 1e-8:
+            heatmap = np.clip((heatmap - lo) / (hi - lo), 0.0, 1.0)
+        else:
+            heatmap = np.zeros_like(heatmap)
+
+    # Gamma: >1.0 suppresses weak activations (sharper-looking overlays)
+    if heatmap_spread_gamma > 0 and abs(heatmap_spread_gamma - 1.0) > 1e-6:
+        heatmap = np.power(np.clip(heatmap, 0, 1), heatmap_spread_gamma)
+        hm_min, hm_max = heatmap.min(), heatmap.max()
+        if hm_max - hm_min > 1e-8:
+            heatmap = (heatmap - hm_min) / (hm_max - hm_min)
 
     # Resize heatmap to match image if needed
     if heatmap.shape != image.shape[:2]:
-        # Use PyTorch interpolation instead of scipy
-        heatmap_tensor = torch.from_numpy(heatmap).unsqueeze(0).unsqueeze(0)
+        heatmap_tensor = torch.from_numpy(heatmap).float().unsqueeze(0).unsqueeze(0)
+        mode = (heatmap_upsample_mode or "bicubic").lower()
+        if mode not in ("bicubic", "bilinear"):
+            mode = "bicubic"
         heatmap_tensor = F.interpolate(
             heatmap_tensor,
             size=(image.shape[0], image.shape[1]),
-            mode='bilinear',
-            align_corners=False
+            mode=mode,
+            align_corners=False,
         )
-        heatmap = heatmap_tensor.squeeze().numpy()
+        heatmap = np.clip(heatmap_tensor.squeeze().numpy(), 0.0, 1.0)
+
+    if heatmap_zero_border_frac > 0:
+        H, W = heatmap.shape
+        t = max(1, int(min(H, W) * heatmap_zero_border_frac))
+        heatmap = heatmap.copy()
+        heatmap[:t, :] = 0.0
+        heatmap[-t:, :] = 0.0
+        heatmap[:, :t] = 0.0
+        heatmap[:, -t:] = 0.0
+        hm_min, hm_max = heatmap.min(), heatmap.max()
+        if hm_max - hm_min > 1e-8:
+            heatmap = (heatmap - hm_min) / (hm_max - hm_min)
+
+    # Optional spatial smoothing to make highlighted regions appear broader
+    if isinstance(heatmap_blur_kernel, int) and heatmap_blur_kernel > 1:
+        k = heatmap_blur_kernel if heatmap_blur_kernel % 2 == 1 else heatmap_blur_kernel + 1
+        t = torch.from_numpy(heatmap).float().unsqueeze(0).unsqueeze(0)
+        t = F.avg_pool2d(t, kernel_size=k, stride=1, padding=k // 2)
+        heatmap = t.squeeze().numpy()
+        hm_min, hm_max = heatmap.min(), heatmap.max()
+        if hm_max - hm_min > 1e-8:
+            heatmap = (heatmap - hm_min) / (hm_max - hm_min)
 
     # Create figure
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    if figure_title:
+        fig.suptitle(figure_title, fontsize=11, y=1.02)
 
-    # Original image
+    # Original image (denormalized)
     axes[0].imshow(image)
-    axes[0].set_title("Original Image")
+    axes[0].set_title("Original")
     axes[0].axis("off")
 
-    # Heatmap
-    im = axes[1].imshow(heatmap, cmap=cmap)
-    axes[1].set_title("Grad-CAM Heatmap")
+    # Heatmap with colorbar (min-max normalized for consistent jet mapping)
+    im = axes[1].imshow(heatmap, cmap=cmap, vmin=0, vmax=1)
+    axes[1].set_title("Grad-CAM (this target class)")
     axes[1].axis("off")
     plt.colorbar(im, ax=axes[1])
 
-    # Overlay
-    axes[2].imshow(image)
-    axes[2].imshow(heatmap, cmap=cmap, alpha=alpha)
+    # Overlay: full-strength base so anatomy matches/clarifies vs Original; heatmap on top
+    if ghosted_overlay:
+        gray = np.mean(image, axis=-1) if image.ndim == 3 else image
+        base = np.stack([gray, gray, gray], axis=-1)
+    else:
+        base = image
+    base = np.clip(base.astype(np.float64), 0, 1)
+    axes[2].imshow(base)
+    axes[2].imshow(heatmap, cmap=cmap, alpha=alpha, vmin=0, vmax=1)
     axes[2].set_title("Overlay")
     axes[2].axis("off")
 

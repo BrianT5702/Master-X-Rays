@@ -2,11 +2,34 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+
+def _signed_aware_cam_normalize(cam_linear: torch.Tensor) -> torch.Tensor:
+    """Turn linear CAM combination into a [0,1] heatmap per batch item.
+
+    Standard Grad-CAM uses ReLU on the weighted sum of feature maps. EfficientNet (and
+    other BN+SiLU stacks) often produce signed activations, so sum(w * A) can be
+    negative everywhere → ReLU → an all-zero map (solid blue in jet). If that happens,
+    we fall back to absolute magnitude so saliency is still visible (diagnostic only).
+    """
+    cam_pos = F.relu(cam_linear)
+    b = cam_linear.shape[0]
+    rows: list[torch.Tensor] = []
+    for i in range(b):
+        c = cam_pos[i]
+        if float(c.max()) < 1e-8:
+            c = torch.abs(cam_linear[i])
+        lo, hi = c.min(), c.max()
+        if float(hi - lo) < 1e-8:
+            rows.append(torch.zeros_like(cam_linear[i]))
+        else:
+            rows.append((c - lo) / (hi - lo + 1e-8))
+    return torch.stack(rows, dim=0)
 
 
 class GradCAM:
@@ -123,17 +146,66 @@ class GradCAM:
         # Global average pooling of gradients
         weights = torch.mean(gradients, dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
 
-        # Weighted combination of activation maps
-        cam = torch.sum(weights * activations, dim=1, keepdim=True)  # (B, 1, H, W)
-        cam = F.relu(cam)  # Apply ReLU
+        # Weighted combination of activation maps (may be signed for EfficientNet)
+        cam_linear = torch.sum(weights * activations, dim=1)  # (B, H, W)
+        return _signed_aware_cam_normalize(cam_linear)
 
-        # Normalize
-        cam = cam.squeeze(1)  # (B, H, W)
-        cam = (cam - cam.min(dim=-1, keepdim=True)[0].min(dim=-2, keepdim=True)[0]) / (
-            cam.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0] + 1e-8
-        )
 
-        return cam
+class HiResCAM(GradCAM):
+    """HiResCAM: uses (ReLU(grad) * activation) summed over channels for sharper maps.
+
+    Draelos et al., "HiResCAM: High-Resolution Class Activation Mapping for Neural Networks"
+    — often localizes better than global-average-pooled Grad-CAM on CNNs.
+    """
+
+    def generate(
+        self, input_tensor: torch.Tensor, target_class: Optional[int] = None
+    ) -> torch.Tensor:
+        was_training = self.model.training
+        self.model.train()
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+        self.gradients = None
+        self.activations = None
+
+        input_tensor = input_tensor.clone().detach().requires_grad_(True)
+
+        with torch.enable_grad():
+            output = self.model(input_tensor)
+
+        self.model.train(was_training)
+
+        if self.activations is None:
+            raise RuntimeError("Activations not captured. Forward hook may have failed.")
+
+        if target_class is None:
+            probs = torch.sigmoid(output.detach())
+            target_class = probs.argmax(dim=1)
+
+        if output.dim() > 1:
+            if isinstance(target_class, int):
+                target = output[:, target_class]
+            else:
+                target = output.gather(1, target_class.unsqueeze(1)).squeeze(1)
+        else:
+            target = output
+
+        if not target.requires_grad:
+            raise RuntimeError(
+                "Target output does not require gradients for HiResCAM backward."
+            )
+
+        self.model.zero_grad()
+        target.sum().backward(retain_graph=False)
+
+        gradients = self.gradients
+        if gradients is None:
+            raise RuntimeError("Gradients not captured for HiResCAM.")
+
+        activations = self.activations.detach()
+        cam_linear = torch.sum(F.relu(gradients) * activations, dim=1)  # (B, H, W)
+        return _signed_aware_cam_normalize(cam_linear)
 
 
 class GradCAMPlusPlus(GradCAM):
@@ -209,43 +281,60 @@ class GradCAMPlusPlus(GradCAM):
         weights = alpha * F.relu(gradients)  # (B, C, H, W)
         weights = torch.sum(weights, dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
 
-        # Weighted combination
-        cam = torch.sum(weights * activations, dim=1, keepdim=True)  # (B, 1, H, W)
-        cam = F.relu(cam)
-
-        # Normalize
-        cam = cam.squeeze(1)  # (B, H, W)
-        cam = (cam - cam.min(dim=-1, keepdim=True)[0].min(dim=-2, keepdim=True)[0]) / (
-            cam.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0] + 1e-8
-        )
-
-        return cam
+        cam_linear = torch.sum(weights * activations, dim=1)  # (B, H, W)
+        return _signed_aware_cam_normalize(cam_linear)
 
 
-def get_target_layer(model: nn.Module, backbone_name: str) -> nn.Module:
+def get_target_layer(
+    model: nn.Module,
+    backbone_name: str,
+    target_layer_mode: str = "default",
+) -> nn.Module:
     """
     Get target layer for Grad-CAM based on backbone architecture.
 
     Args:
         model: Model instance
-        backbone_name: Name of backbone ('densenet121', 'resnet50', 'swin_t')
+        backbone_name: Name of backbone ('densenet121', 'resnet50', 'swin_t', 'dense_swin_hybrid', ...)
 
     Returns:
         Target convolutional layer
     """
     if backbone_name == "densenet121":
         # DenseNet: use the last conv layer in the last dense block
-        # Access: features[-2] is the last _DenseBlock, convert to list to get last _DenseLayer, .conv2 is the final conv
-        # This is a Conv2d layer that will capture high-level features before final pooling
         last_dense_block = model.features[-2]
         last_dense_layer = list(last_dense_block.children())[-1]
         return last_dense_layer.conv2
     elif backbone_name == "resnet50":
-        # ResNet: use last convolutional layer before avgpool
         return model.layer4[-1].conv3
     elif backbone_name == "swin_t":
-        # Swin Transformer: use last stage's norm layer
         return model.features[-1][-1].norm2
+    elif backbone_name == "dense_swin_hybrid":
+        # Explain local path via DenseNet branch (same layer choice as densenet121).
+        dn = model.densenet
+        last_dense_block = dn.features[-2]
+        last_dense_layer = list(last_dense_block.children())[-1]
+        return last_dense_layer.conv2
+    elif backbone_name in ("efficientnet_b0", "efficientnet_b2"):
+        if target_layer_mode == "ultra_high_res":
+            # Earlier stage than high_res → finer CAM grid (less blobby upsampling).
+            return model.features[4][-1].block[1][0]
+        if target_layer_mode == "high_res":
+            # Higher-resolution CAM (roughly 20x20 at 320 input) for better localization
+            # Pick a mid-late depthwise conv before the final stride-2 stage.
+            return model.features[5][-1].block[1][0]
+        if target_layer_mode == "mid_res":
+            # Mid-resolution CAM with stronger semantics than high_res
+            # Typically gives less tiny-point noise and more disease-region context.
+            return model.features[6][-1].block[1][0]
+        # Default: last conv before avgpool (roughly 10x10 at 320 input), semantically strong but coarse.
+        last_conv = None
+        for m in model.features.modules():
+            if isinstance(m, nn.Conv2d):
+                last_conv = m
+        if last_conv is None:
+            raise ValueError("No Conv2d found in EfficientNet features")
+        return last_conv
     else:
         raise ValueError(f"Unsupported backbone: {backbone_name}")
 
@@ -255,7 +344,8 @@ def generate_heatmap(
     input_tensor: torch.Tensor,
     backbone_name: str,
     target_class: Optional[int] = None,
-    method: str = "gradcam",
+    method: str = "gradcam++",
+    target_layer_mode: str = "default",
 ) -> torch.Tensor:
     """
     Convenience function to generate heatmap.
@@ -270,12 +360,15 @@ def generate_heatmap(
     Returns:
         Heatmap tensor (B, H, W)
     """
-    target_layer = get_target_layer(model, backbone_name)
+    target_layer = get_target_layer(model, backbone_name, target_layer_mode=target_layer_mode)
 
-    if method.lower() == "gradcam++":
-        gradcam = GradCAMPlusPlus(model, target_layer)
+    m = method.lower().replace("-", "_")
+    if m == "gradcam++":
+        cam_impl = GradCAMPlusPlus(model, target_layer)
+    elif m in ("hires_cam", "hirescam"):
+        cam_impl = HiResCAM(model, target_layer)
     else:
-        gradcam = GradCAM(model, target_layer)
+        cam_impl = GradCAM(model, target_layer)
 
-    return gradcam.generate(input_tensor, target_class)
+    return cam_impl.generate(input_tensor, target_class)
 

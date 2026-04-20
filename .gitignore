@@ -2,11 +2,11 @@ __pycache__/
 *.pyc
 .env
 .venv/
-data/
 datasets/
 runs/
 checkpoints/
 outputs/
+heatmaps/
 lightning_logs/
 *.ckpt
 *.pth

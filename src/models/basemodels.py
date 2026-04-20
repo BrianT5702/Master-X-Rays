@@ -5,9 +5,21 @@ from typing import Literal
 import torch
 import torchvision.models as tv_models
 
+from src.models.dense_swin_hybrid import DenseSwinHybrid
+
 
 def build_backbone(
-    name: Literal["densenet121", "resnet50", "swin_t"], num_classes: int, pretrained: bool = True, dropout: float = 0.0
+    name: Literal[
+        "densenet121",
+        "resnet50",
+        "swin_t",
+        "efficientnet_b0",
+        "efficientnet_b2",
+        "dense_swin_hybrid",
+    ],
+    num_classes: int,
+    pretrained: bool = True,
+    dropout: float = 0.0,
 ) -> torch.nn.Module:
     if name == "densenet121":
         model = tv_models.densenet121(weights="DEFAULT" if pretrained else None)
@@ -23,11 +35,34 @@ def build_backbone(
     elif name == "resnet50":
         model = tv_models.resnet50(weights="DEFAULT" if pretrained else None)
         in_features = model.fc.in_features
-        model.fc = torch.nn.Linear(in_features, num_classes)
+        if dropout > 0:
+            model.fc = torch.nn.Sequential(
+                torch.nn.Dropout(dropout),
+                torch.nn.Linear(in_features, num_classes),
+            )
+        else:
+            model.fc = torch.nn.Linear(in_features, num_classes)
     elif name == "swin_t":
         model = tv_models.swin_t(weights="DEFAULT" if pretrained else None)
         in_features = model.head.in_features
         model.head = torch.nn.Linear(in_features, num_classes)
+    elif name == "efficientnet_b0":
+        model = tv_models.efficientnet_b0(weights="DEFAULT" if pretrained else None)
+        in_features = model.classifier[1].in_features
+        # Lighter default than torchvision (0.2): small head + rare labels trains faster
+        model.classifier[0] = torch.nn.Dropout(p=dropout if dropout > 0 else 0.1)
+        model.classifier[1] = torch.nn.Linear(in_features, num_classes)
+    elif name == "efficientnet_b2":
+        model = tv_models.efficientnet_b2(weights="DEFAULT" if pretrained else None)
+        in_features = model.classifier[1].in_features
+        model.classifier[0] = torch.nn.Dropout(p=dropout if dropout > 0 else 0.1)
+        model.classifier[1] = torch.nn.Linear(in_features, num_classes)
+    elif name == "dense_swin_hybrid":
+        model = DenseSwinHybrid(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            dropout=dropout,
+        )
     else:
         raise ValueError(f"Unsupported backbone: {name}")
 

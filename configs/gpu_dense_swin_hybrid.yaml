@@ -1,4 +1,5 @@
-# DenseNet-121 + Swin-T hybrid (concat pooled features -> linear head). ImageNet norm (auto).
+# DenseNet-121 + Swin-T hybrid with gated branch fusion (not concat-only). ImageNet norm (auto).
+# Old concat-only checkpoints are incompatible; train from ImageNet weights or expect partial load warnings.
 # ROI + ASL unchanged in pipeline: data.use_roi_extraction / loss.name asymmetric.
 #
 # VRAM: two full backbones per forward. If OOM: batch_size 2, accumulate_grad_batches 24.
@@ -17,7 +18,7 @@ data:
   csv_path: "datasets/NIH Chest X-Rays Master Datasets/archive/Data_Entry_2017.csv"
   image_size: [320, 320]
   num_workers: 3
-  cache_dir: "datasets/cache"
+  cache_dir: "data/processed_320_clahe"
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
@@ -60,8 +61,10 @@ training:
   batch_size: 4
   max_epochs: 70
   early_stopping_patience: 6
+  early_stopping_monitor: val_macro_sensitivity
+  early_stopping_mode: max
   precision: "16-mixed"
-  accumulate_grad_batches: 16
+  accumulate_grad_batches: 4
   optimizer: adamw
   learning_rate: 0.00003
   backbone_lr_mult: 0.12
@@ -80,12 +83,13 @@ model:
   pretrained: true
   dropout: 0.25
   num_classes: 2
-  # No class_weights: imbalance handled by ASL only (see loss.name asymmetric).
+  class_weights: [1.0, 7.5]
 
 loss:
   name: asymmetric
   gamma_neg: 1.5
   gamma_pos: 2.4
-  clip: 0.02
+  clip_per_class: [0.02, 0.25]
+  class_weight_mode: positive_only
   bce_aux_weight: 0.15
   label_smoothing: 0.04

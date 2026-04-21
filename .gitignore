@@ -10,3 +10,4 @@ heatmaps/
 lightning_logs/
 *.ckpt
 *.pth
+data/

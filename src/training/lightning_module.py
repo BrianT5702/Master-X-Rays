@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -10,6 +10,7 @@ from torchmetrics.classification import (
     BinaryAccuracy,
     BinaryAUROC,
     BinaryF1Score,
+    BinaryRecall,
     MultilabelAUROC,
     MultilabelAccuracy,
     MultilabelF1Score,
@@ -49,7 +50,7 @@ def asymmetric_loss(
     targets: torch.Tensor,
     gamma_neg: float = 4.0,
     gamma_pos: float = 1.0,
-    clip: float = 0.2,
+    clip: Union[float, torch.Tensor, List[float], Tuple[float, ...]] = 0.2,
     eps: float = 1e-8,
     reduction: str = "mean",
     class_weights: Optional[torch.Tensor] = None,
@@ -69,7 +70,8 @@ def asymmetric_loss(
         targets: Binary target labels, shape (B, C)
         gamma_neg: Focusing parameter for negative samples (default: 4.0)
         gamma_pos: Focusing parameter for positive samples (default: 1.0)
-        clip: Probability margin for hard thresholding negatives (default: 0.2 for extreme imbalance)
+        clip: Per-class minimum prob for negative ASL clamping (scalar or length-C list/tensor).
+            Use a higher clip on rare classes (e.g. Fibrosis) to suppress easy negatives more aggressively.
         eps: Small epsilon for numerical stability
         reduction: 'mean' or 'none'
     
@@ -77,6 +79,19 @@ def asymmetric_loss(
         Asymmetric loss tensor
     """
     probs = torch.sigmoid(logits)
+    num_c = int(logits.shape[1])
+    if isinstance(clip, torch.Tensor):
+        clip_t = clip.to(device=logits.device, dtype=logits.dtype).view(1, -1)
+    elif isinstance(clip, (list, tuple)):
+        clip_t = torch.tensor(clip, device=logits.device, dtype=logits.dtype).view(1, -1)
+    else:
+        clip_t = torch.full(
+            (1, num_c), float(clip), device=logits.device, dtype=logits.dtype
+        )
+    if clip_t.shape[1] == 1 and num_c > 1:
+        clip_t = clip_t.expand(1, num_c)
+    elif clip_t.shape[1] != num_c:
+        raise ValueError(f"clip must have length 1 or {num_c}, got {clip_t.shape[1]}")
     
     # ASL for multilabel classification (Nodule, Fibrosis)
     # For each class independently: handle positive and negative samples
@@ -92,7 +107,7 @@ def asymmetric_loss(
     # This means: if model predicts p < clip for a negative, treat it as p = clip (easy negative)
     # If model predicts p >= clip, use actual p (hard negative - model is wrong, should be penalized)
     # Formula: p_m = max(p, m) for negatives, where m = clip
-    probs_m = torch.clamp(probs, min=clip)  # Clamp p to minimum of clip for negatives
+    probs_m = torch.max(probs, clip_t)  # per-class clip for negatives
     pt_neg = (1 - probs_m) * (1 - targets)  # pt_neg = 1 - p_m for negatives
     
     # Compute asymmetric loss components
@@ -182,7 +197,7 @@ def _adamw_param_groups(
         if not param.requires_grad:
             continue
         top = name.split(".", 1)[0]
-        if top in ("classifier", "fc", "head"):
+        if top in ("classifier", "fc", "head", "fusion_gate"):
             head_params.append(param)
         else:
             backbone_params.append(param)
@@ -264,6 +279,10 @@ class RareDiseaseModule(LightningModule):
                 )
                 setattr(self, f"{stage}_f1_bins", f1_bins)
                 setattr(self, f"{stage}_acc_bins", acc_bins)
+            # Val-only macro sensitivity (recall at tuned thresholds) for clinical checkpointing
+            self.val_recall_bins = nn.ModuleList(
+                [BinaryRecall(threshold=thr_list[i]) for i in range(num_classes)]  # type: ignore[index]
+            )
             # Placeholders so old code paths can reference (not updated when per-class mode)
             self.train_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
             self.val_f1 = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=self._f1_threshold)
@@ -289,10 +308,7 @@ class RareDiseaseModule(LightningModule):
         return self.model(images)
 
     def _forward_logits(self, images: torch.Tensor, stage: str) -> torch.Tensor:
-        """Train uses Lightning AMP; val/test disable autocast so loss/AUC are finite in 16-mixed."""
-        if stage in ("val", "test") and images.is_cuda:
-            with torch.autocast(device_type="cuda", enabled=False):
-                return self.model(images)
+        """Same forward path for train/val/test; Lightning Trainer applies mixed precision consistently."""
         return self.model(images)
 
     def configure_optimizers(self) -> Dict[str, Any]:
@@ -342,7 +358,11 @@ class RareDiseaseModule(LightningModule):
             # Asymmetric Loss (ASL) - recommended for extreme class imbalance
             gamma_neg = self.loss_config.get("gamma_neg", 4.0)
             gamma_pos = self.loss_config.get("gamma_pos", 1.0)
-            clip = self.loss_config.get("clip", 0.2)
+            clip_cfg = self.loss_config.get("clip_per_class")
+            if clip_cfg is not None:
+                clip: Union[float, List[float]] = [float(x) for x in list(clip_cfg)]
+            else:
+                clip = float(self.loss_config.get("clip", 0.2))
             class_weight_mode = self.loss_config.get("class_weight_mode", "positive_only")
             loss = asymmetric_loss(
                 logits,
@@ -410,6 +430,9 @@ class RareDiseaseModule(LightningModule):
             for i in range(len(f1_bins)):
                 f1_bins[i](preds[:, i], labels[:, i].int())
                 acc_bins[i](preds[:, i], labels[:, i].int())
+            if stage == "val" and hasattr(self, "val_recall_bins"):
+                for i in range(len(self.val_recall_bins)):
+                    self.val_recall_bins[i](preds[:, i], labels[:, i].int())
         else:
             metrics["f1"](preds, labels.int())
             if metrics["acc"] is not None:
@@ -476,6 +499,17 @@ class RareDiseaseModule(LightningModule):
         elif stage == "val":
             self.log("val_f1", macro_f1, prog_bar=True, **end_kw)
             self.log("val_acc", macro_acc, prog_bar=False, **end_kw)
+            if hasattr(self, "val_recall_bins"):
+                recalls = [m.compute() for m in self.val_recall_bins]
+                for m in self.val_recall_bins:
+                    m.reset()
+                macro_sens = torch.stack(
+                    [
+                        x.detach() if isinstance(x, torch.Tensor) else torch.tensor(float(x))
+                        for x in recalls
+                    ]
+                ).mean()
+                self.log("val_macro_sensitivity", macro_sens, prog_bar=False, **end_kw)
         elif stage == "test":
             self.log("test_f1", macro_f1, prog_bar=False, **end_kw)
             self.log("test_acc", macro_acc, prog_bar=False, **end_kw)

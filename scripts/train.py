@@ -206,10 +206,16 @@ def main() -> None:
     # Allows effective larger batch size when GPU memory is limited
     accumulate_grad_batches = training_cfg.get("accumulate_grad_batches", 1)
     
-    # Model checkpointing:
-    # - Primary: governed by Macro-Averaged F1-Score (per thesis)
-    # - Secondary: also track best AUROC and best validation loss for analysis
-    # - Periodic: save every 2 epochs to prevent data loss from crashes
+    # Model checkpointing: prefer rare-disease clinical metrics when per-class thresholds are set.
+    checkpoint_sensitivity = None
+    if per_class_thresholds is not None:
+        checkpoint_sensitivity = ModelCheckpoint(
+            monitor="val_macro_sensitivity",
+            mode="max",
+            filename="best-sensitivity-{epoch:02d}-{val_macro_sensitivity:.4f}",
+            save_top_k=1,
+            save_last=False,
+        )
     checkpoint_f1 = ModelCheckpoint(
         monitor="val_f1",
         mode="max",
@@ -239,6 +245,13 @@ def main() -> None:
         save_top_k=-1,  # Keep all periodic checkpoints
         save_last=False,
     )
+
+    callbacks_list: list = []
+    if checkpoint_sensitivity is not None:
+        callbacks_list.append(checkpoint_sensitivity)
+    callbacks_list.extend(
+        [checkpoint_f1, checkpoint_auc, checkpoint_loss, checkpoint_periodic]
+    )
     
     # CSV logger: separate run folders per backbone (e.g. lightning_logs/csv_metrics_efficientnet_b0/version_2/)
     log_save_dir = PROJECT_ROOT / "lightning_logs"
@@ -263,18 +276,23 @@ def main() -> None:
         version=log_version,  # None = new version; int = same folder when resuming
     )
 
-    # Early stopping on val_auc to stop at peak instead of training into collapse
-    callbacks_list = [checkpoint_f1, checkpoint_auc, checkpoint_loss, checkpoint_periodic]
     early_stop_patience = training_cfg.get("early_stopping_patience", None)
+    early_stop_monitor = training_cfg.get("early_stopping_monitor", "val_auc")
+    early_stop_mode = training_cfg.get("early_stopping_mode")
+    if early_stop_mode is None:
+        early_stop_mode = "max" if early_stop_monitor != "val_loss" else "min"
     if early_stop_patience is not None and early_stop_patience > 0:
         early_stop = EarlyStopping(
-            monitor="val_auc",
-            mode="max",
-            patience=early_stop_patience,
+            monitor=early_stop_monitor,
+            mode=str(early_stop_mode),
+            patience=int(early_stop_patience),
             verbose=True,
         )
         callbacks_list.append(early_stop)
-        print(f"Early stopping enabled: stop if val_auc does not improve for {early_stop_patience} epochs")
+        print(
+            f"Early stopping enabled: monitor={early_stop_monitor} ({early_stop_mode}), "
+            f"patience={early_stop_patience}"
+        )
     swa_start = training_cfg.get("swa_epoch_start")
     if swa_start is not None:
         callbacks_list.append(
@@ -308,8 +326,12 @@ def main() -> None:
         val_dataloaders=dataloaders["val"],
         ckpt_path=str(ckpt_path) if ckpt_path else None,  # Resume from checkpoint if provided
     )
-    # Test on best val_auc weights, not last epoch (last often has lower AUC after overfitting)
-    best_test_ckpt = checkpoint_auc.best_model_path or checkpoint_f1.best_model_path
+    # Test on best clinical weights when available (macro sensitivity), else macro F1, else AUC
+    best_test_ckpt = None
+    if checkpoint_sensitivity is not None and checkpoint_sensitivity.best_model_path:
+        best_test_ckpt = checkpoint_sensitivity.best_model_path
+    if not best_test_ckpt:
+        best_test_ckpt = checkpoint_f1.best_model_path or checkpoint_auc.best_model_path
     if best_test_ckpt:
         best_test_ckpt = str(Path(best_test_ckpt).resolve())
         print(f"\nTest set: using best checkpoint weights (not last epoch): {best_test_ckpt}")
@@ -324,13 +346,18 @@ def main() -> None:
     print("="*60)
     
     # Get the best checkpoint path
-    # Use best AUC checkpoint for heatmaps (better metric for rare disease detection)
-    # Fallback to best F1 if AUC checkpoint not available
-    best_checkpoint = checkpoint_auc.best_model_path if checkpoint_auc.best_model_path else checkpoint_f1.best_model_path
-    if checkpoint_auc.best_model_path:
-        print(f"Using best AUC checkpoint (val_auc={checkpoint_auc.best_model_score:.4f})")
-    else:
+    best_checkpoint = None
+    if checkpoint_sensitivity is not None and checkpoint_sensitivity.best_model_path:
+        best_checkpoint = checkpoint_sensitivity.best_model_path
+        print(
+            f"Using best sensitivity checkpoint (val_macro_sensitivity={checkpoint_sensitivity.best_model_score:.4f})"
+        )
+    if not best_checkpoint and checkpoint_f1.best_model_path:
+        best_checkpoint = checkpoint_f1.best_model_path
         print(f"Using best F1 checkpoint (val_f1={checkpoint_f1.best_model_score:.4f})")
+    if not best_checkpoint and checkpoint_auc.best_model_path:
+        best_checkpoint = checkpoint_auc.best_model_path
+        print(f"Using best AUC checkpoint (val_auc={checkpoint_auc.best_model_score:.4f})")
     if best_checkpoint:
         # Convert to absolute path if relative
         if not Path(best_checkpoint).is_absolute():

@@ -12,7 +12,9 @@ import sys
 import os
 from tqdm import tqdm
 import pandas as pd
-from PIL import Image, ImageOps, ImageOps
+import numpy as np
+import cv2
+from PIL import Image, ImageOps
 
 # Fix Windows console encoding for emoji
 if sys.platform == "win32":
@@ -27,6 +29,25 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data.roi_extraction import extract_lung_roi
 
 
+def _apply_clahe_lab(
+    image: Image.Image,
+    clip_limit: float = 2.0,
+    tile_grid_size: tuple[int, int] = (8, 8),
+) -> Image.Image:
+    """CLAHE on L channel in LAB space (after ROI, before resize)."""
+    arr = np.asarray(image.convert("RGB"))
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(
+        clipLimit=float(clip_limit),
+        tileGridSize=(int(tile_grid_size[0]), int(tile_grid_size[1])),
+    )
+    l2 = clahe.apply(l_ch)
+    merged = cv2.merge((l2, a_ch, b_ch))
+    rgb = cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
+    return Image.fromarray(rgb)
+
+
 def preprocess_images(
     csv_path: Path,
     images_root: Path,
@@ -36,6 +57,9 @@ def preprocess_images(
     apply_roi_mask: bool = True,
     label_columns: list[str] | None = None,
     overwrite_existing: bool = False,
+    use_clahe: bool = False,
+    clahe_clip_limit: float = 2.0,
+    clahe_tile_grid: tuple[int, int] = (8, 8),
 ) -> None:
     """
     Pre-process all images: extract ROI, resize, and save to cache.
@@ -119,6 +143,9 @@ def preprocess_images(
     print(f"   Format: JPEG (quality=95) - 3-5x faster loading than PNG")
     print(f"   ROI extraction: {'Enabled' if use_roi_extraction else 'Disabled'}")
     print(f"   Body mask (reduce shortcut): {'Yes' if (use_roi_extraction and apply_roi_mask) else 'No'}")
+    print(f"   CLAHE (LAB-L): {'Yes' if use_clahe else 'No'}")
+    if use_clahe:
+        print(f"      clipLimit={clahe_clip_limit}, tileGridSize={clahe_tile_grid}")
     print(f"   Target size: {image_size}")
     
     failed = []
@@ -149,7 +176,14 @@ def preprocess_images(
             # Extract ROI (and body mask) if enabled - same pipeline as training
             if use_roi_extraction:
                 image, _ = extract_lung_roi(image, apply_mask=apply_roi_mask)
-            
+
+            if use_clahe:
+                image = _apply_clahe_lab(
+                    image,
+                    clip_limit=clahe_clip_limit,
+                    tile_grid_size=clahe_tile_grid,
+                )
+
             # Resize to target size
             image = image.resize(image_size, Image.Resampling.BILINEAR)
             
@@ -219,18 +253,40 @@ def main() -> None:
     parser.add_argument("--no-mask", action="store_true", help="Disable body mask (only when using ROI)")
     parser.add_argument("--overwrite", action="store_true", help="Re-process all images (rebuild cache with current ROI/mask)")
     parser.add_argument("--labels", nargs="+", default=["Nodule", "Fibrosis"], help="Filter for specific labels")
+    parser.add_argument(
+        "--use-clahe",
+        action="store_true",
+        help="Apply CLAHE on L (LAB) after ROI, before resize (contrast for subtle textures).",
+    )
+    parser.add_argument("--clahe-clip-limit", type=float, default=2.0, help="CLAHE clipLimit (default 2.0)")
+    parser.add_argument(
+        "--clahe-tile",
+        type=int,
+        nargs=2,
+        default=[8, 8],
+        metavar=("H", "W"),
+        help="CLAHE tileGridSize (default 8 8)",
+    )
     
     args = parser.parse_args()
+
+    cache_dir = args.cache_dir
+    if args.use_clahe and cache_dir == Path("datasets/cache"):
+        cache_dir = PROJECT_ROOT / "data" / "processed_320_clahe"
+        print(f"[INFO] --use-clahe: default cache_dir -> {cache_dir}")
     
     preprocess_images(
         csv_path=args.csv,
         images_root=args.images_root,
-        cache_dir=args.cache_dir,
+        cache_dir=cache_dir,
         image_size=tuple(args.image_size),
         use_roi_extraction=not args.no_roi,
         apply_roi_mask=not args.no_mask,
         label_columns=args.labels if args.labels else None,
         overwrite_existing=args.overwrite,
+        use_clahe=args.use_clahe,
+        clahe_clip_limit=float(args.clahe_clip_limit),
+        clahe_tile_grid=(int(args.clahe_tile[0]), int(args.clahe_tile[1])),
     )
 
 

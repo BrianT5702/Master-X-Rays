@@ -8,11 +8,11 @@ import torchvision.models as tv_models
 
 
 class DenseSwinHybrid(nn.Module):
-    """Parallel DenseNet-121 and Swin-T, concat pooled features, linear head.
+    """Parallel DenseNet-121 and Swin-T with gated fusion before the classifier.
 
-    DenseNet emphasizes fine-grained textures (dense connectivity); Swin-T models
-    long-range structure via shifted windows. Both see the same tensor (use
-    ImageNet normalization). ROI and ASL live outside this module (dataset + Lightning).
+    DenseNet branch: local texture; Swin branch: global context. Pooled Swin features
+    use the same path as torchvision Swin (norm -> permute -> AdaptiveAvgPool2d(1) -> flatten).
+    A learnable gate scales each branch before concatenation for the final linear head.
     """
 
     def __init__(
@@ -20,6 +20,7 @@ class DenseSwinHybrid(nn.Module):
         num_classes: int = 2,
         pretrained: bool = True,
         dropout: float = 0.2,
+        gate_hidden_dim: int = 256,
     ) -> None:
         super().__init__()
         w_dd = "DEFAULT" if pretrained else None
@@ -34,6 +35,14 @@ class DenseSwinHybrid(nn.Module):
         self.swin.head = nn.Identity()
 
         fused = d_dim + s_dim
+        gh = max(32, min(int(gate_hidden_dim), fused))
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(fused, gh),
+            nn.ReLU(inplace=True),
+            nn.Linear(gh, 2),
+            nn.Sigmoid(),
+        )
+
         if dropout and float(dropout) > 0.0:
             self.head = nn.Sequential(
                 nn.Dropout(p=float(dropout)),
@@ -44,8 +53,19 @@ class DenseSwinHybrid(nn.Module):
 
         self.num_classes = num_classes
 
+    def _swin_pooled(self, x: torch.Tensor) -> torch.Tensor:
+        """Swin trunk through global average pool (same as full Swin forward without head)."""
+        z = self.swin.features(x)
+        z = self.swin.norm(z)
+        z = self.swin.permute(z)
+        z = self.swin.avgpool(z)
+        z = self.swin.flatten(z)
+        return z
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z_d = self.densenet(x)
-        z_s = self.swin(x)
-        z = torch.cat([z_d, z_s], dim=1)
-        return self.head(z)
+        z_s = self._swin_pooled(x)
+        h = torch.cat([z_d, z_s], dim=1)
+        g = self.fusion_gate(h)
+        z_g = torch.cat([z_d * g[:, 0:1], z_s * g[:, 1:2]], dim=1)
+        return self.head(z_g)

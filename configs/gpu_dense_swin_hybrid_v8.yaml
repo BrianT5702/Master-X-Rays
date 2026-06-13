@@ -1,17 +1,16 @@
-# DenseNet-121 + Swin-T hybrid with gated branch fusion (not concat-only).
-# Preprocessed cache (CLAHE) is [0,1] RGB; use_normalization: false feeds the model raw [0,1]
-# (distribution shift vs ImageNet pretrain — retrain from scratch; optional higher LR on first layers).
-# Old concat-only checkpoints are incompatible; train from ImageNet weights or expect partial load warnings.
-# ROI + ASL unchanged in pipeline: data.use_roi_extraction / loss.name asymmetric.
+# DenseNet-121 + Swin-T hybrid — v8 (iterate from strong v6; avoid v7 weighted-sampler regression).
 #
-# VRAM: two full backbones per forward. If OOM: batch_size 2, accumulate_grad_batches 24.
+# Changes vs v6: longer schedule + patience, slightly milder fibrosis push, tiny dropout tweak,
+# slightly higher head LR multiplier. Train fresh from ImageNet (--resume only if intentional).
 #
-#   py scripts/train.py --config configs/gpu_dense_swin_hybrid.yaml
+#   py scripts/train.py --config configs/gpu_dense_swin_hybrid_v8.yaml
 #
-# Then: find_threshold.py (val) -> per_class_thresholds -> evaluate.py (test)
-#
+# Optional inference boost on v6/v8 checkpoints (no retrain):
+#   py scripts/find_threshold.py ... --tta-hflip
+#   py scripts/evaluate.py ... --tta-hflip
+
 experiment:
-  name: gpu_dense_swin_hybrid
+  name: gpu_dense_swin_hybrid_v8
   seed: 42
 
 data:
@@ -41,7 +40,6 @@ augmentations:
   lower_artifact_erase_p: 0.58
   lower_artifact_erase_height_ratio: 0.26
   lower_artifact_erase_width_ratio: 0.30
-  # Stronger band/lateral/device erases (vs 0.18/0.15/0.20) to reduce hardware/edge shortcuts in CAMs.
   bottom_band_erase_p: 0.22
   bottom_band_erase_h_min: 0.08
   bottom_band_erase_h_max: 0.16
@@ -60,41 +58,39 @@ augmentations:
   random_erasing_ratio: [0.3, 3.0]
 
 training:
-  # v6 calibration-focused: less positive bias, better AUROC/F1 trade-off
   batch_size: 4
-  max_epochs: 70
-  early_stopping_patience: 6
+  max_epochs: 85
+  early_stopping_patience: 10
   early_stopping_monitor: val_auc
   early_stopping_mode: max
   precision: "16-mixed"
   accumulate_grad_batches: 4
   optimizer: adamw
   learning_rate: 0.00003
-  backbone_lr_mult: 0.12
+  backbone_lr_mult: 0.13
   swa_epoch_start: null
   weight_decay: 0.005
   scheduler: cosine
-  warmup_epochs: 1
+  warmup_epochs: 2
   gradient_clip_val: 1.0
   use_weighted_sampling: false
   weighted_sampling_dampen: 0.90
   prediction_threshold: 0.80
   f1_metric_threshold: 0.05
-  # Re-tune with find_threshold.py after retraining (thresholds below are stale otherwise).
-  per_class_thresholds: [0.8200, 0.8150]  # val tune, v6 best-auc ep21
+  per_class_thresholds: [0.8250, 0.8300]
 
 model:
   backbone: dense_swin_hybrid
   pretrained: true
-  dropout: 0.25
+  dropout: 0.23
   num_classes: 2
-  class_weights: [1.0, 6.0]
+  class_weights: [1.0, 5.5]
 
 loss:
   name: asymmetric
   gamma_neg: 1.5
-  gamma_pos_per_class: [2.0, 2.6]
-  clip_per_class: [0.02, 0.18]
+  gamma_pos_per_class: [2.0, 2.5]
+  clip_per_class: [0.02, 0.17]
   class_weight_mode: positive_only
-  bce_aux_weight: 0.05
-  label_smoothing: 0.02
+  bce_aux_weight: 0.045
+  label_smoothing: 0.018

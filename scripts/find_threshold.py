@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +23,9 @@ import yaml
 
 from src.data.datasets import create_dataloaders, resolve_data_normalization
 from src.models.basemodels import build_backbone
+from src.training.calibration import load_calibration_json, temperatures_tensor_from_dict
 from src.training.lightning_module import RareDiseaseModule
+from src.training.tta import HFlipLogitsTTA
 from torchmetrics.classification import (
     BinaryF1Score,
     BinaryPrecision,
@@ -63,6 +66,17 @@ def parse_args() -> argparse.Namespace:
         default=0.06,
         help="Half-width around coarse best threshold for refinement (default 0.06).",
     )
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        help="Optional JSON from calibrate_temperature.py; logits scaled as z/T before sigmoid.",
+    )
+    parser.add_argument(
+        "--tta-hflip",
+        action="store_true",
+        help="Average logits with horizontally flipped inputs (match evaluate.py --tta-hflip).",
+    )
     return parser.parse_args()
 
 
@@ -71,15 +85,23 @@ def _best_f1_threshold_1d(
     labels_1d: torch.Tensor,
     thresholds: list[float],
 ) -> tuple[float, float]:
+    """Pick threshold maximizing F1; on ties prefer **higher** threshold (fewer false positives)."""
     best_f1, best_t = -1.0, thresholds[0]
+    eps = 1e-7
     for t in thresholds:
         m = BinaryF1Score(threshold=t)
         m.update(probs_1d, labels_1d)
         f1_val = m.compute().item()
-        if f1_val > best_f1:
+        if f1_val > best_f1 + eps:
             best_f1 = f1_val
             best_t = t
+        elif abs(f1_val - best_f1) <= eps and t > best_t:
+            best_t = t
     return best_t, best_f1
+
+
+# Refinement never uses threshold 0: it trivially predicts all samples positive (recall=1, useless precision).
+_MIN_REFINE_THRESHOLD = 0.01
 
 
 def _refine_threshold_f1(
@@ -89,7 +111,7 @@ def _refine_threshold_f1(
     fine_step: float,
     half_width: float,
 ) -> tuple[float, float]:
-    lo = max(0.0, coarse_t - half_width)
+    lo = max(_MIN_REFINE_THRESHOLD, coarse_t - half_width)
     hi = min(1.0, coarse_t + half_width)
     fine_list: list[float] = []
     t = lo
@@ -110,7 +132,22 @@ def load_config(path: Path) -> dict:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
+
+    ckpt_path = Path(args.checkpoint)
+    if not ckpt_path.is_absolute():
+        ckpt_path = PROJECT_ROOT / ckpt_path
+    if not ckpt_path.is_file():
+        print(f"Error: checkpoint not found: {ckpt_path}", flush=True)
+        sys.exit(1)
+
+    cfg_path = Path(args.config)
+    if not cfg_path.is_absolute():
+        cfg_path = PROJECT_ROOT / cfg_path
+    if not cfg_path.is_file():
+        print(f"Error: config not found: {cfg_path}", flush=True)
+        sys.exit(1)
+
+    config = load_config(cfg_path)
     data_cfg = config["data"]
     training_cfg = config["training"]
     model_cfg = config["model"]
@@ -152,7 +189,7 @@ def main() -> None:
         dropout=model_cfg.get("dropout", 0.0),
     )
     module = RareDiseaseModule.load_from_checkpoint(
-        str(args.checkpoint),
+        str(ckpt_path),
         model=backbone,
         learning_rate=training_cfg["learning_rate"],
         weight_decay=training_cfg["weight_decay"],
@@ -172,11 +209,16 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     module = module.to(device)
 
+    if args.tta_hflip:
+        module.model = HFlipLogitsTTA(module.model)
+        print("TTA enabled: horizontal-flip logit average", flush=True)
+
     # Collect all logits and labels (no Lightning progress bar — can look "stuck" on large val sets)
     n_batches = len(loader)
     print(
         f"Scoring {args.split} split: {n_batches} batches "
-        f"(batch_size={training_cfg['batch_size']}, device={device}) — this may take several minutes..."
+        f"(batch_size={training_cfg['batch_size']}, device={device}) — this may take several minutes...",
+        flush=True,
     )
     all_logits = []
     all_labels = []
@@ -187,13 +229,38 @@ def main() -> None:
             logits = module(images)
             all_logits.append(logits.cpu())
             all_labels.append(labels)
-            if (i + 1) % 50 == 0 or (i + 1) == n_batches:
-                print(f"  ... batch {i + 1}/{n_batches}")
+            if i == 0 or (i + 1) % 25 == 0 or (i + 1) == n_batches:
+                print(f"  ... batch {i + 1}/{n_batches}", flush=True)
     logits = torch.cat(all_logits, dim=0)
     labels = torch.cat(all_labels, dim=0).int()
 
+    if args.calibration is not None:
+        cal_path = args.calibration
+        if not cal_path.is_absolute():
+            cal_path = PROJECT_ROOT / cal_path
+        cal = load_calibration_json(cal_path)
+        T = temperatures_tensor_from_dict(cal)
+        logits = logits / T.view(1, -1)
+        print(f"Applied temperature calibration from {cal_path} ({cal.get('mode')})\n")
+
     probs = torch.sigmoid(logits)
     num_classes = logits.shape[1]
+
+    label_names = ["Nodule", "Fibrosis"]
+    prob_hdr = (
+        "Calibrated probability stats"
+        if args.calibration is not None
+        else "Probability stats (uncalibrated)"
+    )
+    print(f"{prob_hdr} (per class, all {args.split} samples):", flush=True)
+    for ci, name in enumerate(label_names):
+        p = probs[:, ci]
+        print(
+            f"  {name}: min={p.min().item():.4f} max={p.max().item():.4f} "
+            f"mean={p.mean().item():.4f} pos_mean={p[labels[:, ci] == 1].mean().item() if (labels[:, ci] == 1).any() else float('nan'):.4f}",
+            flush=True,
+        )
+    print(flush=True)
 
     # AUC is threshold-independent
     auroc = MultilabelAUROC(num_labels=num_classes, average="macro")
@@ -201,40 +268,50 @@ def main() -> None:
     print(f"Split: {args.split}  |  Macro AUC (threshold-independent): {auc_val:.4f}\n")
 
     thresholds = [float(x.strip()) for x in args.thresholds.split(",")]
+    pmax = float(probs.max())
+    if pmax < 0.65:
+        print(
+            f"Note: max calibrated prob is {pmax:.4f} (< 0.65). "
+            "Adding a dense 0.01..0.60 grid so F1 search is meaningful.\n",
+            flush=True,
+        )
+        dense = [round(0.01 * i, 2) for i in range(1, 61)]
+        thresholds = sorted(set(thresholds + dense))
+
     print("Threshold  |  Macro F1")
     print("-----------|----------")
     best_f1 = -1.0
-    best_thr = None
+    best_thr: float | None = None
+    eps_tie = 1e-7
     for t in sorted(thresholds):
         f1_metric = MultilabelF1Score(num_labels=num_classes, average="macro", threshold=t)
         f1_val = f1_metric(probs, labels).item()
         print(f"  {t:.2f}     |  {f1_val:.4f}")
-        if f1_val > best_f1:
+        if best_thr is None or f1_val > best_f1 + eps_tie:
             best_f1 = f1_val
+            best_thr = t
+        elif abs(f1_val - best_f1) <= eps_tie and t > best_thr:
             best_thr = t
     print("-----------|----------")
     print(f"\nBest single threshold for multilabel macro F1: {best_thr}  (F1 = {best_f1:.4f})")
     print("(Same threshold on both labels — often suboptimal when Nodule vs Fibrosis behave differently.)\n")
 
     # Per-class thresholds → paste into training.per_class_thresholds in your training config
-    label_names = ["Nodule", "Fibrosis"]
     suggested: list[float] = []
     print("--- Per-class F1 (independent threshold per label) ---")
     for ci, name in enumerate(label_names):
         pcol = probs[:, ci]
         ycol = labels[:, ci]
-        best_cf1, best_ct = -1.0, sorted(thresholds)[0]
+        thr_sorted = sorted(thresholds)
         print(f"\n{name}:")
         print("Thr   | F1")
         print("------|-------")
-        for t in sorted(thresholds):
+        for t in thr_sorted:
             m = BinaryF1Score(threshold=t)
             m.update(pcol, ycol)
             f1_val = m.compute().item()
             print(f"{t:.2f}  | {f1_val:.4f}")
-            if f1_val > best_cf1:
-                best_cf1 = f1_val
-                best_ct = t
+        best_ct, best_cf1 = _best_f1_threshold_1d(pcol, ycol, thr_sorted)
         if not args.no_refine:
             best_ct, best_cf1 = _refine_threshold_f1(
                 pcol, ycol, best_ct, args.fine_step, args.fine_window
@@ -257,12 +334,18 @@ def main() -> None:
     m1.update(probs[:, 1], labels[:, 1])
     macro_pc = (m0.compute() + m1.compute()) / 2.0
     print(f"\nMacro F1 using best per-class thresholds {suggested}: {macro_pc.item():.4f}")
-    cfg_rel = args.config.as_posix() if hasattr(args.config, "as_posix") else str(args.config)
+    cfg_rel = cfg_path.as_posix()
     print(f"Add to {cfg_rel} under training:")
     print(
-        f"  per_class_thresholds: [{suggested[0]:.4f}, {suggested[1]:.4f}]  # [Nodule, Fibrosis]"
+        f"  per_class_thresholds: [{suggested[0]:.4f}, {suggested[1]:.4f}]  # [Nodule, Fibrosis]",
+        flush=True,
     )
+    print("Done.", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)

@@ -1,17 +1,16 @@
-# DenseNet-121 + Swin-T hybrid with gated branch fusion (not concat-only).
-# Preprocessed cache (CLAHE) is [0,1] RGB; use_normalization: false feeds the model raw [0,1]
-# (distribution shift vs ImageNet pretrain — retrain from scratch; optional higher LR on first layers).
-# Old concat-only checkpoints are incompatible; train from ImageNet weights or expect partial load warnings.
-# ROI + ASL unchanged in pipeline: data.use_roi_extraction / loss.name asymmetric.
+# DenseNet-121 + Swin-T hybrid (v7): conservative imbalance tuning to improve F1 stability.
+# Start fresh from ImageNet-pretrained backbones (no resume from old heads).
 #
-# VRAM: two full backbones per forward. If OOM: batch_size 2, accumulate_grad_batches 24.
+# Run:
+#   py scripts/train.py --config configs/gpu_dense_swin_hybrid_v7.yaml
 #
-#   py scripts/train.py --config configs/gpu_dense_swin_hybrid.yaml
-#
-# Then: find_threshold.py (val) -> per_class_thresholds -> evaluate.py (test)
-#
+# After training:
+#   py scripts/find_threshold.py --checkpoint <best-auc.ckpt> --config configs/gpu_dense_swin_hybrid_v7.yaml --split val
+#   # paste per_class_thresholds into this file
+#   py scripts/evaluate.py --checkpoint <best-auc.ckpt> --config configs/gpu_dense_swin_hybrid_v7.yaml --split test
+
 experiment:
-  name: gpu_dense_swin_hybrid
+  name: gpu_dense_swin_hybrid_v7
   seed: 42
 
 data:
@@ -41,7 +40,6 @@ augmentations:
   lower_artifact_erase_p: 0.58
   lower_artifact_erase_height_ratio: 0.26
   lower_artifact_erase_width_ratio: 0.30
-  # Stronger band/lateral/device erases (vs 0.18/0.15/0.20) to reduce hardware/edge shortcuts in CAMs.
   bottom_band_erase_p: 0.22
   bottom_band_erase_h_min: 0.08
   bottom_band_erase_h_max: 0.16
@@ -60,10 +58,9 @@ augmentations:
   random_erasing_ratio: [0.3, 3.0]
 
 training:
-  # v6 calibration-focused: less positive bias, better AUROC/F1 trade-off
   batch_size: 4
-  max_epochs: 70
-  early_stopping_patience: 6
+  max_epochs: 80
+  early_stopping_patience: 8
   early_stopping_monitor: val_auc
   early_stopping_mode: max
   precision: "16-mixed"
@@ -76,25 +73,28 @@ training:
   scheduler: cosine
   warmup_epochs: 1
   gradient_clip_val: 1.0
-  use_weighted_sampling: false
-  weighted_sampling_dampen: 0.90
+  # Mild weighted sampling to increase positive exposure without overwhelming negatives.
+  use_weighted_sampling: true
+  weighted_sampling_dampen: 0.97
   prediction_threshold: 0.80
   f1_metric_threshold: 0.05
-  # Re-tune with find_threshold.py after retraining (thresholds below are stale otherwise).
-  per_class_thresholds: [0.8200, 0.8150]  # val tune, v6 best-auc ep21
+  # Val tune from find_threshold.py on best-auc ckpt (v7 ep9).
+  per_class_thresholds: [0.9300, 0.9350]  # [Nodule, Fibrosis]
 
 model:
   backbone: dense_swin_hybrid
   pretrained: true
   dropout: 0.25
   num_classes: 2
-  class_weights: [1.0, 6.0]
+  # Slightly reduced fibrosis weight to avoid over-shifting all logits upward.
+  class_weights: [1.0, 4.5]
 
 loss:
   name: asymmetric
   gamma_neg: 1.5
-  gamma_pos_per_class: [2.0, 2.6]
-  clip_per_class: [0.02, 0.18]
+  gamma_pos_per_class: [1.6, 2.2]
+  clip_per_class: [0.02, 0.14]
   class_weight_mode: positive_only
-  bce_aux_weight: 0.05
-  label_smoothing: 0.02
+  # Lower auxiliary BCE / smoothing than v6 to reduce calibration collapse pressure.
+  bce_aux_weight: 0.02
+  label_smoothing: 0.005

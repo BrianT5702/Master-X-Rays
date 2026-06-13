@@ -49,7 +49,7 @@ def asymmetric_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     gamma_neg: float = 4.0,
-    gamma_pos: float = 1.0,
+    gamma_pos: Union[float, torch.Tensor, List[float], Tuple[float, ...]] = 1.0,
     clip: Union[float, torch.Tensor, List[float], Tuple[float, ...]] = 0.2,
     eps: float = 1e-8,
     reduction: str = "mean",
@@ -69,7 +69,8 @@ def asymmetric_loss(
         logits: Raw model outputs (before sigmoid), shape (B, C)
         targets: Binary target labels, shape (B, C)
         gamma_neg: Focusing parameter for negative samples (default: 4.0)
-        gamma_pos: Focusing parameter for positive samples (default: 1.0)
+        gamma_pos: Per-class positive focusing (scalar or length-C list/tensor). Raise on rare
+            classes (e.g. Fibrosis) to emphasize hard positives.
         clip: Per-class minimum prob for negative ASL clamping (scalar or length-C list/tensor).
             Use a higher clip on rare classes (e.g. Fibrosis) to suppress easy negatives more aggressively.
         eps: Small epsilon for numerical stability
@@ -92,6 +93,19 @@ def asymmetric_loss(
         clip_t = clip_t.expand(1, num_c)
     elif clip_t.shape[1] != num_c:
         raise ValueError(f"clip must have length 1 or {num_c}, got {clip_t.shape[1]}")
+
+    if isinstance(gamma_pos, torch.Tensor):
+        gamma_pos_t = gamma_pos.to(device=logits.device, dtype=logits.dtype).view(1, -1)
+    elif isinstance(gamma_pos, (list, tuple)):
+        gamma_pos_t = torch.tensor(gamma_pos, device=logits.device, dtype=logits.dtype).view(1, -1)
+    else:
+        gamma_pos_t = torch.full(
+            (1, num_c), float(gamma_pos), device=logits.device, dtype=logits.dtype
+        )
+    if gamma_pos_t.shape[1] == 1 and num_c > 1:
+        gamma_pos_t = gamma_pos_t.expand(1, num_c)
+    elif gamma_pos_t.shape[1] != num_c:
+        raise ValueError(f"gamma_pos must have length 1 or {num_c}, got {gamma_pos_t.shape[1]}")
     
     # ASL for multilabel classification (Nodule, Fibrosis)
     # For each class independently: handle positive and negative samples
@@ -112,7 +126,7 @@ def asymmetric_loss(
     
     # Compute asymmetric loss components
     # Positive loss: focal loss variant - focuses on hard positive examples
-    loss_pos = -targets * torch.log(pt_pos + eps) * torch.pow(1 - pt_pos, gamma_pos)
+    loss_pos = -targets * torch.log(pt_pos + eps) * torch.pow(1 - pt_pos, gamma_pos_t)
     # Negative loss: with hard thresholding to prevent easy negatives from suppressing rare positives
     loss_neg = -(1 - targets) * torch.log(1 - pt_neg + eps) * torch.pow(pt_neg, gamma_neg)
     
@@ -357,7 +371,11 @@ class RareDiseaseModule(LightningModule):
         if loss_name == "asymmetric" or loss_name == "asl":
             # Asymmetric Loss (ASL) - recommended for extreme class imbalance
             gamma_neg = self.loss_config.get("gamma_neg", 4.0)
-            gamma_pos = self.loss_config.get("gamma_pos", 1.0)
+            gamma_pos_cfg = self.loss_config.get("gamma_pos_per_class")
+            if gamma_pos_cfg is not None:
+                gamma_pos: Union[float, List[float]] = [float(x) for x in list(gamma_pos_cfg)]
+            else:
+                gamma_pos = float(self.loss_config.get("gamma_pos", 1.0))
             clip_cfg = self.loss_config.get("clip_per_class")
             if clip_cfg is not None:
                 clip: Union[float, List[float]] = [float(x) for x in list(clip_cfg)]

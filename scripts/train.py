@@ -78,6 +78,10 @@ def main() -> None:
             else f"auto (backbone={model_cfg['backbone']})"
         )
         print(f"Data normalization: {normalization} ({src})")
+    else:
+        print(
+            "Data normalization: off (model sees ToTensor [0,1] RGB — match preprocessed cache pixels)"
+        )
 
     dataloaders = create_dataloaders(
         csv_path=csv_path,
@@ -326,12 +330,34 @@ def main() -> None:
         val_dataloaders=dataloaders["val"],
         ckpt_path=str(ckpt_path) if ckpt_path else None,  # Resume from checkpoint if provided
     )
-    # Test on best clinical weights when available (macro sensitivity), else macro F1, else AUC
-    best_test_ckpt = None
-    if checkpoint_sensitivity is not None and checkpoint_sensitivity.best_model_path:
-        best_test_ckpt = checkpoint_sensitivity.best_model_path
-    if not best_test_ckpt:
-        best_test_ckpt = checkpoint_f1.best_model_path or checkpoint_auc.best_model_path
+    # Post-train test: prefer checkpoint aligned with early_stopping_monitor (do not always force
+    # best-sensitivity when per_class_thresholds exist — sensitivity can be flat/poor under val_auc training).
+    def _first_ckpt_path(*cbs: object) -> str | None:
+        for cb in cbs:
+            if cb is None:
+                continue
+            p = getattr(cb, "best_model_path", None)
+            if p:
+                return str(p)
+        return None
+
+    _mon = str(training_cfg.get("early_stopping_monitor", "val_auc")).strip().lower()
+    if _mon == "val_macro_sensitivity":
+        best_test_ckpt = _first_ckpt_path(
+            checkpoint_sensitivity, checkpoint_auc, checkpoint_f1, checkpoint_loss
+        )
+    elif _mon == "val_f1":
+        best_test_ckpt = _first_ckpt_path(
+            checkpoint_f1, checkpoint_auc, checkpoint_sensitivity, checkpoint_loss
+        )
+    elif _mon == "val_loss":
+        best_test_ckpt = _first_ckpt_path(
+            checkpoint_loss, checkpoint_auc, checkpoint_f1, checkpoint_sensitivity
+        )
+    else:
+        best_test_ckpt = _first_ckpt_path(
+            checkpoint_auc, checkpoint_f1, checkpoint_sensitivity, checkpoint_loss
+        )
     if best_test_ckpt:
         best_test_ckpt = str(Path(best_test_ckpt).resolve())
         print(f"\nTest set: using best checkpoint weights (not last epoch): {best_test_ckpt}")
@@ -345,19 +371,52 @@ def main() -> None:
     print("Training completed! Generating heatmaps...")
     print("="*60)
     
-    # Get the best checkpoint path
+    # Heatmaps: same priority as test checkpoint (see early_stopping_monitor above)
     best_checkpoint = None
-    if checkpoint_sensitivity is not None and checkpoint_sensitivity.best_model_path:
-        best_checkpoint = checkpoint_sensitivity.best_model_path
-        print(
-            f"Using best sensitivity checkpoint (val_macro_sensitivity={checkpoint_sensitivity.best_model_score:.4f})"
-        )
-    if not best_checkpoint and checkpoint_f1.best_model_path:
-        best_checkpoint = checkpoint_f1.best_model_path
-        print(f"Using best F1 checkpoint (val_f1={checkpoint_f1.best_model_score:.4f})")
-    if not best_checkpoint and checkpoint_auc.best_model_path:
-        best_checkpoint = checkpoint_auc.best_model_path
-        print(f"Using best AUC checkpoint (val_auc={checkpoint_auc.best_model_score:.4f})")
+    if _mon == "val_macro_sensitivity":
+        for cb, label, score_attr in (
+            (checkpoint_sensitivity, "sensitivity", "val_macro_sensitivity"),
+            (checkpoint_auc, "AUC", "val_auc"),
+            (checkpoint_f1, "F1", "val_f1"),
+        ):
+            if cb is not None and cb.best_model_path:
+                best_checkpoint = cb.best_model_path
+                sc = getattr(cb, "best_model_score", None)
+                print(f"Using best {label} checkpoint ({score_attr}={sc:.4f})" if sc is not None else f"Using best {label} checkpoint")
+                break
+    elif _mon == "val_f1":
+        for cb, label, score_attr in (
+            (checkpoint_f1, "F1", "val_f1"),
+            (checkpoint_auc, "AUC", "val_auc"),
+            (checkpoint_sensitivity, "sensitivity", "val_macro_sensitivity"),
+        ):
+            if cb is not None and cb.best_model_path:
+                best_checkpoint = cb.best_model_path
+                sc = getattr(cb, "best_model_score", None)
+                print(f"Using best {label} checkpoint ({score_attr}={sc:.4f})" if sc is not None else f"Using best {label} checkpoint")
+                break
+    elif _mon == "val_loss":
+        for cb, label, score_attr in (
+            (checkpoint_loss, "loss", "val_loss"),
+            (checkpoint_auc, "AUC", "val_auc"),
+            (checkpoint_f1, "F1", "val_f1"),
+        ):
+            if cb is not None and cb.best_model_path:
+                best_checkpoint = cb.best_model_path
+                sc = getattr(cb, "best_model_score", None)
+                print(f"Using best {label} checkpoint ({score_attr}={sc:.4f})" if sc is not None else f"Using best {label} checkpoint")
+                break
+    else:
+        for cb, label, score_attr in (
+            (checkpoint_auc, "AUC", "val_auc"),
+            (checkpoint_f1, "F1", "val_f1"),
+            (checkpoint_sensitivity, "sensitivity", "val_macro_sensitivity"),
+        ):
+            if cb is not None and cb.best_model_path:
+                best_checkpoint = cb.best_model_path
+                sc = getattr(cb, "best_model_score", None)
+                print(f"Using best {label} checkpoint ({score_attr}={sc:.4f})" if sc is not None else f"Using best {label} checkpoint")
+                break
     if best_checkpoint:
         # Convert to absolute path if relative
         if not Path(best_checkpoint).is_absolute():

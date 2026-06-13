@@ -76,9 +76,9 @@ training:
   per_class_thresholds: [0.80, 0.90]  # [Nodule, Fibrosis] — replace from find_threshold output
 
 model:
-  backbone: efficientnet_b0
+  backbone: densenet121
   pretrained: true
-  dropout: 0.3
+  dropout: 0.0
   num_classes: 2
   class_weights: [1.0, 6.5]
 

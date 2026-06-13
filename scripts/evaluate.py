@@ -16,7 +16,9 @@ import yaml
 
 from src.data.datasets import create_dataloaders, resolve_data_normalization
 from src.models.basemodels import build_backbone
+from src.training.calibration import wrap_model_with_calibration
 from src.training.lightning_module import RareDiseaseModule
+from src.training.tta import HFlipLogitsTTA
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +53,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help="Number of samples for heatmaps (default 20).",
+    )
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        help="Optional JSON from calibrate_temperature.py; wraps model with z -> z/T.",
+    )
+    parser.add_argument(
+        "--tta-hflip",
+        action="store_true",
+        help="Average logits with horizontally flipped image (CXR TTA). Retune thresholds with "
+        "find_threshold.py --tta-hflip on val if you care about F1.",
     )
     return parser.parse_args()
 
@@ -146,6 +160,20 @@ def main() -> None:
         map_location="cpu",
     )
 
+    if args.calibration is not None:
+        cal_path = args.calibration
+        if not cal_path.is_absolute():
+            cal_path = PROJECT_ROOT / cal_path
+        if not cal_path.exists():
+            print(f"Error: calibration file not found: {cal_path}")
+            sys.exit(1)
+        lightning_module.model = wrap_model_with_calibration(lightning_module.model, cal_path)
+        print(f"Wrapped model with temperature calibration: {cal_path}")
+
+    if args.tta_hflip:
+        lightning_module.model = HFlipLogitsTTA(lightning_module.model)
+        print("TTA enabled: horizontal-flip logit average")
+
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     precision = 32 if accelerator == "cpu" else training_cfg.get("precision", "16-mixed")
 
@@ -164,7 +192,7 @@ def main() -> None:
         heatmap_script = PROJECT_ROOT / "scripts" / "generate_heatmaps.py"
         if heatmap_script.exists():
             print("\nGenerating heatmaps...")
-            subprocess.run([
+            heatmap_cmd = [
                 sys.executable, str(heatmap_script),
                 "--checkpoint", str(ckpt_path),
                 "--config", str(args.config),
@@ -179,7 +207,11 @@ def main() -> None:
                 "--heatmap_pct_high", "97",
                 "--heatmap_upsample", "bicubic",
                 "--heatmap_zero_border_frac", "0.02",
-            ], check=True, cwd=str(PROJECT_ROOT))
+            ]
+            if args.calibration is not None:
+                cal_p = args.calibration if args.calibration.is_absolute() else PROJECT_ROOT / args.calibration
+                heatmap_cmd.extend(["--calibration", str(cal_p)])
+            subprocess.run(heatmap_cmd, check=True, cwd=str(PROJECT_ROOT))
             print("Heatmaps saved under heatmaps/<split>/hires_cam/<backbone>/version_XX/")
         else:
             print("Heatmap script not found; skipping heatmaps.")

@@ -74,7 +74,7 @@ training:
 model:
   backbone: densenet121
   pretrained: true
-  dropout: 0.3
+  dropout: 0.0
   num_classes: 2
   class_weights: [1.0, 6.5]
 

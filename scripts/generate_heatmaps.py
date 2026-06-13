@@ -32,6 +32,7 @@ from torch.utils.data import DataLoader
 
 from src.data.datasets import create_dataloaders, resolve_data_normalization
 from src.models.basemodels import build_backbone
+from src.training.calibration import wrap_model_with_calibration
 from src.training.lightning_module import RareDiseaseModule
 from src.xai.gradcam import generate_heatmap
 from src.xai.visualize import visualize_heatmap
@@ -150,6 +151,12 @@ def parse_args() -> argparse.Namespace:
         default="bicubic",
         help="Interpolation when upsampling CAM to image size.",
     )
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        help="Optional JSON from calibrate_temperature.py (same as evaluate.py).",
+    )
     return parser.parse_args()
 
 
@@ -174,7 +181,9 @@ def backbone_to_model_folder_name(backbone_name: str) -> str:
     return tag or "model"
 
 
-def load_model_from_checkpoint(checkpoint_path: Path, config: dict) -> torch.nn.Module:
+def load_model_from_checkpoint(
+    checkpoint_path: Path, config: dict, calibration: Path | None = None
+) -> torch.nn.Module:
     """Load trained model from Lightning checkpoint."""
     # Build model architecture (needed for checkpoint loading)
     model_cfg = config["model"]
@@ -216,8 +225,13 @@ def load_model_from_checkpoint(checkpoint_path: Path, config: dict) -> torch.nn.
     
     # Extract the underlying PyTorch model
     model = checkpoint_module.model
+    if calibration is not None:
+        cal_path = calibration if calibration.is_absolute() else PROJECT_ROOT / calibration
+        if not cal_path.exists():
+            raise FileNotFoundError(f"Calibration file not found: {cal_path}")
+        model = wrap_model_with_calibration(model, cal_path)
     model.eval()
-    
+
     return model
 
 
@@ -275,7 +289,7 @@ def main() -> None:
     
     # Load model
     print(f"Loading model from {args.checkpoint}...")
-    model = load_model_from_checkpoint(args.checkpoint, config)
+    model = load_model_from_checkpoint(args.checkpoint, config, calibration=args.calibration)
     
     # Move to GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -388,9 +402,15 @@ def main() -> None:
             )
             save_path = output_dir / filename
 
-            figure_title = (
-                f"Image: {img_id}  |  Grad-CAM target: {class_name} (logit index {class_idx})"
-            )
+            if backbone_name == "dense_swin_hybrid":
+                figure_title = (
+                    f"Image: {img_id}  |  Fused CAM (DenseNet+Swin, gate-weighted) "
+                    f"target: {class_name} (logit index {class_idx})"
+                )
+            else:
+                figure_title = (
+                    f"Image: {img_id}  |  Grad-CAM target: {class_name} (logit index {class_idx})"
+                )
             visualize_heatmap(
                 image=images[0].cpu(),
                 heatmap=heatmap[0].cpu(),

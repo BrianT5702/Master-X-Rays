@@ -50,6 +50,14 @@ class GradCAM:
         self.forward_hook_handle = self.target_layer.register_forward_hook(self._save_activation)
         self.backward_hook_handle = self.target_layer.register_full_backward_hook(self._save_gradient)
 
+    def remove_hooks(self) -> None:
+        if getattr(self, "forward_hook_handle", None) is not None:
+            self.forward_hook_handle.remove()
+            self.forward_hook_handle = None
+        if getattr(self, "backward_hook_handle", None) is not None:
+            self.backward_hook_handle.remove()
+            self.backward_hook_handle = None
+
     def _save_activation(self, module, input, output) -> None:
         """Save activation maps from forward pass."""
         # Store activations - DO NOT clone or detach! Keep them in computation graph
@@ -315,6 +323,9 @@ def get_target_layer(
         last_dense_block = dn.features[-2]
         last_dense_layer = list(last_dense_block.children())[-1]
         return last_dense_layer.conv2
+    elif backbone_name == "dense_swin_hybrid_swin":
+        # Spatial maps after Swin stages: NCHW (B, 768, ~10, 10 at 320 input).
+        return model.swin.permute
     elif backbone_name in ("efficientnet_b0", "efficientnet_b2"):
         if target_layer_mode == "ultra_high_res":
             # Earlier stage than high_res → finer CAM grid (less blobby upsampling).
@@ -339,6 +350,84 @@ def get_target_layer(
         raise ValueError(f"Unsupported backbone: {backbone_name}")
 
 
+def _cam_from_layer(
+    model: nn.Module,
+    input_tensor: torch.Tensor,
+    target_layer: nn.Module,
+    target_class: Optional[int],
+    method: str,
+) -> torch.Tensor:
+    m = method.lower().replace("-", "_")
+    if m == "gradcam++":
+        cam_impl = GradCAMPlusPlus(model, target_layer)
+    elif m in ("hires_cam", "hirescam"):
+        cam_impl = HiResCAM(model, target_layer)
+    else:
+        cam_impl = GradCAM(model, target_layer)
+    try:
+        return cam_impl.generate(input_tensor, target_class)
+    finally:
+        cam_impl.remove_hooks()
+
+
+def _hybrid_branch_gate(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Fusion gate (B, 2) from concatenated DenseNet+Swin pooled features (no grad)."""
+    with torch.no_grad():
+        was_training = model.training
+        model.eval()
+        z_d = model.densenet(x)
+        z_s = model._swin_pooled(x)
+        h = torch.cat([z_d, z_s], dim=1)
+        g = model.fusion_gate(h)
+        model.train(was_training)
+    return g
+
+
+def _minmax_hw(t: torch.Tensor) -> torch.Tensor:
+    """Per-batch-item min-max on (B, H, W) -> [0, 1]."""
+    b = t.shape[0]
+    rows: list[torch.Tensor] = []
+    for i in range(b):
+        u = t[i]
+        lo, hi = u.min(), u.max()
+        if float(hi - lo) < 1e-8:
+            rows.append(torch.zeros_like(u))
+        else:
+            rows.append((u - lo) / (hi - lo + 1e-8))
+    return torch.stack(rows, dim=0)
+
+
+def generate_hybrid_fused_heatmap(
+    model: nn.Module,
+    input_tensor: torch.Tensor,
+    target_class: Optional[int] = None,
+    method: str = "hires_cam",
+    target_layer_mode: str = "default",
+) -> torch.Tensor:
+    """Gate-weighted fusion of CAM from DenseNet and Swin branches (matches hybrid logits path).
+
+    Single-branch CAM on only DenseNet ignored the Swin contribution and the fusion gate.
+    This runs the same CAM method on (1) DenseNet last dense conv and (2) Swin ``permute``
+    output (NCHW spatial), upsamples both to input resolution, and combines with
+    ``g_d * CAM_d + g_s * CAM_s`` using fusion gate weights ``[g_d, g_s]`` from a no-grad forward.
+    """
+    layer_d = get_target_layer(model, "dense_swin_hybrid", target_layer_mode=target_layer_mode)
+    layer_s = get_target_layer(model, "dense_swin_hybrid_swin", target_layer_mode=target_layer_mode)
+
+    cam_d = _cam_from_layer(model, input_tensor, layer_d, target_class, method)
+    cam_s = _cam_from_layer(model, input_tensor, layer_s, target_class, method)
+
+    h, w = int(input_tensor.shape[2]), int(input_tensor.shape[3])
+    cam_d = F.interpolate(cam_d.unsqueeze(1), size=(h, w), mode="bilinear", align_corners=False).squeeze(1)
+    cam_s = F.interpolate(cam_s.unsqueeze(1), size=(h, w), mode="bilinear", align_corners=False).squeeze(1)
+
+    gate = _hybrid_branch_gate(model, input_tensor.detach())
+    g_d = gate[:, 0:1]
+    g_s = gate[:, 1:2]
+    fused = g_d * cam_d + g_s * cam_s
+    return _minmax_hw(fused)
+
+
 def generate_heatmap(
     model: nn.Module,
     input_tensor: torch.Tensor,
@@ -360,15 +449,15 @@ def generate_heatmap(
     Returns:
         Heatmap tensor (B, H, W)
     """
+    if backbone_name == "dense_swin_hybrid":
+        return generate_hybrid_fused_heatmap(
+            model,
+            input_tensor,
+            target_class=target_class,
+            method=method,
+            target_layer_mode=target_layer_mode,
+        )
+
     target_layer = get_target_layer(model, backbone_name, target_layer_mode=target_layer_mode)
-
-    m = method.lower().replace("-", "_")
-    if m == "gradcam++":
-        cam_impl = GradCAMPlusPlus(model, target_layer)
-    elif m in ("hires_cam", "hirescam"):
-        cam_impl = HiResCAM(model, target_layer)
-    else:
-        cam_impl = GradCAM(model, target_layer)
-
-    return cam_impl.generate(input_tensor, target_class)
+    return _cam_from_layer(model, input_tensor, target_layer, target_class, method)
 

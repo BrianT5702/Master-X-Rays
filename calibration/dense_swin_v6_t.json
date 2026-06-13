@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "mode": "per_class",
+  "label_order": [
+    "Nodule",
+    "Fibrosis"
+  ],
+  "temperatures": [
+    2059.071533203125,
+    2111.9912109375
+  ]
+}

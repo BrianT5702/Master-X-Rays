@@ -31,10 +31,14 @@ from src.data.roi_extraction import extract_lung_roi
 
 def _apply_clahe_lab(
     image: Image.Image,
-    clip_limit: float = 2.0,
+    clip_limit: float = 1.8,
     tile_grid_size: tuple[int, int] = (8, 8),
 ) -> Image.Image:
-    """CLAHE on L channel in LAB space (after ROI, before resize)."""
+    """CLAHE on L channel in LAB space (after ROI, before resize).
+
+    Default clipLimit 1.8 is slightly gentler than 2.0 to reduce strong edge halos after
+    resize; use --clahe-clip-limit 2.0 if you prefer maximum local contrast.
+    """
     arr = np.asarray(image.convert("RGB"))
     lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
@@ -58,7 +62,7 @@ def preprocess_images(
     label_columns: list[str] | None = None,
     overwrite_existing: bool = False,
     use_clahe: bool = False,
-    clahe_clip_limit: float = 2.0,
+    clahe_clip_limit: float = 1.8,
     clahe_tile_grid: tuple[int, int] = (8, 8),
 ) -> None:
     """
@@ -258,7 +262,12 @@ def main() -> None:
         action="store_true",
         help="Apply CLAHE on L (LAB) after ROI, before resize (contrast for subtle textures).",
     )
-    parser.add_argument("--clahe-clip-limit", type=float, default=2.0, help="CLAHE clipLimit (default 2.0)")
+    parser.add_argument(
+        "--clahe-clip-limit",
+        type=float,
+        default=1.8,
+        help="CLAHE clipLimit (default 1.8; higher = stronger local contrast, more edge emphasis)",
+    )
     parser.add_argument(
         "--clahe-tile",
         type=int,

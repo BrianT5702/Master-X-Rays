@@ -97,9 +97,36 @@ def analyze_heatmap_region(heatmap_path: Path) -> dict:
     }
 
 
+def parse_args() -> argparse.Namespace:
+    import argparse
+
+    p = argparse.ArgumentParser(description="Analyze Grad-CAM heatmap focus (shortcut check).")
+    p.add_argument(
+        "--heatmap_dir",
+        type=Path,
+        default=Path("heatmaps/test/gradcam"),
+        help="Directory containing sample_*_class_*_pred_*_gt_*.png files.",
+    )
+    p.add_argument(
+        "--threshold-nodule",
+        type=float,
+        default=0.825,
+        help="Decision threshold for Nodule class (match per_class_thresholds[0]).",
+    )
+    p.add_argument(
+        "--threshold-fibrosis",
+        type=float,
+        default=0.815,
+        help="Decision threshold for Fibrosis class (match per_class_thresholds[1]).",
+    )
+    return p.parse_args()
+
+
 def main():
-    heatmap_dir = Path("heatmaps/test/gradcam")
-    
+    args = parse_args()
+    heatmap_dir = args.heatmap_dir
+    class_thresholds = {"Nodule": args.threshold_nodule, "Fibrosis": args.threshold_fibrosis}
+
     if not heatmap_dir.exists():
         print(f"ERROR: Heatmap directory not found: {heatmap_dir}")
         return
@@ -131,8 +158,8 @@ def main():
         
         analysis = analyze_heatmap_region(heatmap_path)
         
-        # Classify prediction
-        pred_positive = metadata['pred_prob'] > 0.3  # Using threshold from config
+        thr = class_thresholds.get(metadata['class_name'], 0.5)
+        pred_positive = metadata['pred_prob'] > thr
         gt_positive = metadata['gt_label'] == 1
         
         if pred_positive and gt_positive:
@@ -156,6 +183,7 @@ def main():
     print("HEATMAP ACCURACY ANALYSIS")
     print("=" * 60)
     
+    print(f"\nDecision thresholds: Nodule={class_thresholds['Nodule']}, Fibrosis={class_thresholds['Fibrosis']}")
     print(f"\nPrediction Statistics:")
     print(f"   True Positives:  {len(stats['true_positives'])}")
     print(f"   False Positives: {len(stats['false_positives'])}")
@@ -180,7 +208,7 @@ def main():
     
     # Analyze false positives (most concerning)
     if stats['false_positives']:
-        print(f"\nWARNING: FALSE POSITIVES Analysis (gt=0, pred>0.3):")
+        print(f"\nWARNING: FALSE POSITIVES Analysis (gt=0, pred>thr):")
         fp_focused = sum(1 for _, a in stats['false_positives'] if a['is_focused'])
         fp_unfocused = len(stats['false_positives']) - fp_focused
         print(f"   Total FPs: {len(stats['false_positives'])}")
@@ -201,7 +229,7 @@ def main():
     
     # Analyze true positives
     if stats['true_positives']:
-        print(f"\nTRUE POSITIVES Analysis (gt=1, pred>0.3):")
+        print(f"\nTRUE POSITIVES Analysis (gt=1, pred>thr):")
         tp_focused = sum(1 for _, a in stats['true_positives'] if a['is_focused'])
         print(f"   Total TPs: {len(stats['true_positives'])}")
         print(f"   Focused on center: {tp_focused} ({tp_focused/len(stats['true_positives'])*100:.1f}%)")
@@ -240,4 +268,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

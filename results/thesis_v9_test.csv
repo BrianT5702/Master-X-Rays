@@ -1,0 +1,6 @@
+split,class,threshold,auroc,f1,precision,recall,specificity,TP,TN,FP,FN
+test,Nodule,0.825,0.7935,0.3472,0.3123,0.3908,0.9485,247,10020,544,385
+test,Fibrosis,0.815,0.7977,0.1502,0.1667,0.1367,0.9914,19,10962,95,120
+
+macro_auroc,0.7956
+macro_f1,0.2487

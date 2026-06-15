@@ -89,7 +89,7 @@ training:
   weighted_sampling_dampen: 0.90
   prediction_threshold: 0.80
   f1_metric_threshold: 0.05
-  per_class_thresholds: null  # fill after find_threshold.py on val
+  per_class_thresholds: [0.8250, 0.8150]  # val tune, v9 best-auc ep24
 
 model:
   backbone: dense_swin_hybrid

@@ -30,6 +30,7 @@ from torchmetrics.classification import (
     BinaryF1Score,
     BinaryPrecision,
     BinaryRecall,
+    BinarySpecificity,
     MultilabelAUROC,
     MultilabelF1Score,
 )
@@ -320,11 +321,14 @@ def main() -> None:
 
         pr_m = BinaryPrecision(threshold=best_ct)
         rc_m = BinaryRecall(threshold=best_ct)
+        sp_m = BinarySpecificity(threshold=best_ct)
         pr_m.update(pcol, ycol)
         rc_m.update(pcol, ycol)
+        sp_m.update(pcol, ycol)
         print(
             f"  => At chosen thr: precision={pr_m.compute().item():.4f}, "
-            f"recall={rc_m.compute().item():.4f}"
+            f"recall={rec_m.compute().item():.4f}, "
+            f"specificity={sp_m.compute().item():.4f}"
         )
         suggested.append(best_ct)
 

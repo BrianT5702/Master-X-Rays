@@ -1,0 +1,104 @@
+# DenseNet-121 + Swin-T hybrid — v9b (fix probability collapse + fibrosis recall).
+#
+# v9 result (ep24): test AUROC 0.795 (good) but probs still bunched ~0.79–0.91 → thresholds ~0.82,
+# fibrosis recall ~0.14, many false-positive heatmaps on negatives.
+#
+# v9b changes vs v9:
+#   - Stronger easy-negative ASL: gamma_neg 3.0 (was 2.0)
+#   - Weaker global positive push: gamma_pos [1.3, 2.3], clip [0.02, 0.12]
+#   - Fibrosis weight 6.5; lower bce_aux (0.02) and label_smoothing (0.008)
+#   - Slower backbone fine-tune (backbone_lr_mult 0.08)
+# Train FRESH from ImageNet — do NOT resume v9/v8 collapsed checkpoints.
+#
+# Thesis "good" targets (test, val-tuned thresholds):
+#   macro AUROC >= 0.80 | macro F1 >= 0.28 | fibrosis recall >= 0.25 | neg mean prob < 0.35
+#
+#   py scripts/train.py --config configs/gpu_dense_swin_hybrid_v9b.yaml
+#   py scripts/find_threshold.py --checkpoint <best-auc.ckpt> --config configs/gpu_dense_swin_hybrid_v9b.yaml --split val
+#   py scripts/thesis_report.py --checkpoint <best-auc.ckpt> --config configs/gpu_dense_swin_hybrid_v9b.yaml --split test
+
+experiment:
+  name: gpu_dense_swin_hybrid_v9b
+  seed: 42
+
+data:
+  nih_root: "datasets/NIH Chest X-Rays Master Datasets/archive"
+  chexpert_root: "datasets/Standford ML Group X-Rays Chest Master Datasets/cheXphoto-master/cheXphoto-master"
+  csv_path: "datasets/NIH Chest X-Rays Master Datasets/archive/Data_Entry_2017.csv"
+  image_size: [320, 320]
+  num_workers: 3
+  cache_dir: "data/processed_320_clahe"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  patient_split: true
+  use_roi_extraction: true
+  apply_roi_mask: true
+  use_normalization: false
+
+augmentations:
+  legacy_cache_train_pipeline: true
+  legacy_cache_minimal_erases: false
+  horizontal_flip_prob: 0.5
+  rotation_degrees: 10.0
+  random_noise_std: 0.01
+  use_gan_synthetic: false
+  random_translate_frac: 0.035
+  corner_erase_p: 0.0
+  lower_artifact_erase_p: 0.62
+  lower_artifact_erase_height_ratio: 0.26
+  lower_artifact_erase_width_ratio: 0.30
+  bottom_band_erase_p: 0.26
+  bottom_band_erase_h_min: 0.08
+  bottom_band_erase_h_max: 0.16
+  lateral_edge_erase_p: 0.26
+  lateral_edge_width_ratio: 0.06
+  top_edge_erase_p: 0.16
+  top_edge_height_ratio: 0.16
+  device_artifact_erase_p: 0.34
+  device_artifact_upper_ratio: 0.72
+  device_artifact_threshold: 224
+  device_artifact_min_area: 12
+  device_artifact_max_area_ratio: 0.020
+  device_artifact_max_components: 3
+  random_erasing_p: 0.07
+  random_erasing_scale: [0.02, 0.10]
+  random_erasing_ratio: [0.3, 3.0]
+
+training:
+  batch_size: 4
+  max_epochs: 80
+  early_stopping_patience: 8
+  early_stopping_monitor: val_auc
+  early_stopping_mode: max
+  precision: "16-mixed"
+  accumulate_grad_batches: 4
+  optimizer: adamw
+  learning_rate: 0.00003
+  backbone_lr_mult: 0.08
+  swa_epoch_start: null
+  weight_decay: 0.005
+  scheduler: cosine
+  warmup_epochs: 2
+  gradient_clip_val: 1.0
+  use_weighted_sampling: false
+  weighted_sampling_dampen: 0.90
+  prediction_threshold: 0.80
+  f1_metric_threshold: 0.05
+  per_class_thresholds: null  # fill after find_threshold.py on val
+
+model:
+  backbone: dense_swin_hybrid
+  pretrained: true
+  dropout: 0.25
+  num_classes: 2
+  class_weights: [1.0, 6.5]
+
+loss:
+  name: asymmetric
+  gamma_neg: 3.0
+  gamma_pos_per_class: [1.3, 2.3]
+  clip_per_class: [0.02, 0.12]
+  class_weight_mode: positive_only
+  bce_aux_weight: 0.02
+  label_smoothing: 0.008
